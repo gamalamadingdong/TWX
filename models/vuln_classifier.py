@@ -18,6 +18,7 @@ import seaborn as sns
 import joblib
 from time import time
 from storage.vulnerability_db import VulnerabilityDatabase
+from data_processing.cwe_vulnerability_types import get_vulnerability_type
 
 def prepare_data(data_path="analysis/classification_data.csv"):
     """Load and prepare data for vulnerability type classification while preserving details."""
@@ -143,15 +144,11 @@ def extract_mitigation_info(references):
     return mitigation_info
 
 def map_cwe_to_vuln_type(cwe):
-    db = VulnerabilityDatabase()
-    conn = db.connect()
-    cursor = conn.cursor()
-    cursor.execute("SELECT category FROM weaknesses WHERE cwe_id=?", (cwe,))
-    result = cursor.fetchone()
-    conn.close()  # Add this line to close the connection
-    if result and result[0]:
-        return result[0]
-    return 'Other'
+    """Map CWE ID to a meaningful vulnerability type category."""
+    if not cwe or not isinstance(cwe, str):
+        return 'Unknown'
+    
+    return get_vulnerability_type(cwe)
 
 def build_type_classifier(X_train, y_train, cat_features, num_features):
     """Build and train a vulnerability type classifier with tuning."""
@@ -221,14 +218,15 @@ def build_type_classifier(X_train, y_train, cat_features, num_features):
         ])
         default_pipeline.fit(X_train, y_train)
         return default_pipeline
+
 def analyze_vulnerability_landscape(df):
     """Analyze the vulnerability landscape including prevalence and severity."""
     # Vulnerability type distribution (prevalence)
     plt.figure(figsize=(14, 8))
     type_counts = df["vuln_type"].value_counts()
     
-    # Horizontal bar chart for better readability with many categories
-    sns.barplot(y=type_counts.index, x=type_counts.values, palette="viridis")
+    # Fix for deprecation warning
+    sns.barplot(y=type_counts.index, x=type_counts.values, color="steelblue")
     plt.title("Distribution of Vulnerability Types (Prevalence)")
     plt.xlabel("Count")
     plt.ylabel("Vulnerability Type")
@@ -266,8 +264,8 @@ def analyze_vulnerability_landscape(df):
         # Handle missing values more robustly
         valid_severities = type_df["severity"].dropna()
         if len(valid_severities) > 0:
-            # Map severity to weights, with a default of 0 for unknown severities
-            severity_values = valid_severities.map(severity_weights).fillna(0)
+            # Convert to string type before mapping to avoid categorical issues
+            severity_values = valid_severities.astype(str).map(severity_weights).fillna(0) 
             weighted_score = sum(severity_values) / len(valid_severities)
         else:
             weighted_score = 0
@@ -283,7 +281,7 @@ def analyze_vulnerability_landscape(df):
     
     # Plot combined risk score
     plt.figure(figsize=(14, 8))
-    sns.barplot(y="vuln_type", x="risk_score", data=risk_df, palette="rocket")
+    sns.barplot(y="vuln_type", x="risk_score", data=risk_df, color="purple")
     plt.title("Combined Risk Score by Vulnerability Type (Prevalence × Severity)")
     plt.xlabel("Risk Score")
     plt.ylabel("Vulnerability Type")
@@ -292,25 +290,38 @@ def analyze_vulnerability_landscape(df):
     
     return risk_df
 
-
-def main():
-    # Prepare data
+def main(skip_training=False):
+    # IMPORTANT: Make skip_training check at the very beginning
+    
     X_train, X_test, y_train_type, y_test_type, y_train_sev, y_test_sev, df, cat_features, num_features = prepare_data()
-    
-    # Build vulnerability type classifier
-    print("Building vulnerability type classifier...")
-    type_model = build_type_classifier(X_train, y_train_type, cat_features, num_features)
-    
-    # Evaluate model
-    print("Evaluating vulnerability type classifier...")
-    y_pred_type = type_model.predict(X_test)
-    print("Classification Report for Vulnerability Types:")
-    print(classification_report(y_test_type, y_pred_type))
-    
-    # Save model
-    model_path = "models/vuln_type_classifier.joblib"
-    joblib.dump(type_model, model_path)
-    print(f"Type classifier saved to {model_path}")
+    #skip_training = True
+    if skip_training == False:
+        # Build vulnerability type classifier
+        print("Building vulnerability type classifier...")
+        type_model = build_type_classifier(X_train, y_train_type, cat_features, num_features)
+        
+        # Evaluate model
+        print("Evaluating vulnerability type classifier...")
+        y_pred_type = type_model.predict(X_test)
+        print("Classification Report for Vulnerability Types:")
+        print(classification_report(y_test_type, y_pred_type))
+        
+        # Save model
+        model_path = "models/vuln_type_classifier.joblib"
+        joblib.dump(type_model, model_path)
+        print(f"Type classifier saved to {model_path}")
+    else:
+        print("Skipping training, loading existing model (if available)...")
+        try:
+            # Load the existing model if available
+            model_path = "models/vuln_type_classifier.joblib"
+            if os.path.exists(model_path):
+                joblib.load(model_path)
+                print(f"Loaded existing model from {model_path}")
+            else:
+                print(f"No existing model found at {model_path}, but continuing with analysis")
+        except Exception as e:
+            print(f"Error loading model: {e}, but continuing with analysis")
     
     # Analyze vulnerability landscape (prevalence and severity)
     print("Analyzing vulnerability landscape...")
@@ -318,8 +329,7 @@ def main():
     print("\nTop 5 vulnerability types by combined risk score:")
     print(risk_df[["vuln_type", "count", "avg_severity_weight", "risk_score"]].head(5))
     
-    # NEW: Save the complete dataset with classifications for further analysis
-    # This preserves all original details plus our new classifications
+    # Save the complete dataset with classifications for further analysis
     output_path = "analysis/classified_vulnerabilities_with_details.csv"
     df.to_csv(output_path, index=False)
     print(f"Complete classified dataset with details saved to {output_path}")
@@ -330,4 +340,9 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    #analyze_vulnerability_landscape
+    # Check for command line arguments to skip training
+    if len(sys.argv) > 1 and sys.argv[1] == "--skip-training":
+        main(skip_training=True)
+    else:
+        main(skip_training=False)
