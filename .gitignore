@@ -22,3 +22,4 @@ Summary.md
 data_collection/raw_data/*.json
 data_collection/raw_data/*.csv
 data_collection/raw_data/*.txt
+**/__pycache__/**
