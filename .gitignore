@@ -25,3 +25,5 @@ data_collection/raw_data/*.txt
 **/__pycache__/**
 storage/__pycache__/vulnerability_db.cpython-312.__pycache__
 storage/__pycache__/*
+storage/__pycache__/vulnerability_db.cpython-312.pyc
+**/__pycache__/**

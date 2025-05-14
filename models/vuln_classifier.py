@@ -18,13 +18,13 @@ import seaborn as sns
 import joblib
 from time import time
 from storage.vulnerability_db import VulnerabilityDatabase
-from data_processing.cwe_vulnerability_types import get_vulnerability_type
 
 def prepare_data(data_path="analysis/classification_data.csv"):
     """Load and prepare data for vulnerability type classification while preserving details."""
     df = pd.read_csv(data_path, low_memory=False, parse_dates=['published_date', 'modified_date'])
     print("preparing data")
     # Define features (keep as is)
+    # TODO: Improve For Production.  These features were a first pass and should be improved
     cat_features = ["cwe", "vendor", "product", "av", "ac", "pr", "ui",
                    "known_exploited", "has_cisa_advisory", "has_vendor_advisory"]
     
@@ -54,7 +54,7 @@ def prepare_data(data_path="analysis/classification_data.csv"):
     df["base_score"] = df["base_score"].fillna(0)
     df["severity"] = pd.cut(df["base_score"], 
                            bins=[0, 3.9, 6.9, 8.9, 10.0],
-                           labels=["Low", "Medium", "High", "Critical"])
+                           labels=["Low", "Medium", "High", "Critical"]) #should have a severity value
     
     # Preserve detailed information
     if 'affected_services_details' not in df.columns and 'product_details' in df.columns:
@@ -64,6 +64,8 @@ def prepare_data(data_path="analysis/classification_data.csv"):
         df['mitigation_info'] = df['references'].apply(extract_mitigation_info)
     
     # Reduce cardinality of categorical features to minimize one-hot encoding explosion
+    # TODO: Improve For Production.  Did this because of the size of the dataset and training it on my laptop
+
     print("Limiting cardinality of high-dimensional categorical features...")
     
     # Keep only top vendors, map others to 'Other_Vendor'
@@ -103,31 +105,6 @@ def prepare_data(data_path="analysis/classification_data.csv"):
     
     return X_train, X_test, y_train_type, y_test_type, y_train_sev, y_test_sev, df, cat_features_without_cwe, num_features
 
-def analyze_services_by_vulnerability_type(df):
-    """Analyze which services are most affected by each vulnerability type."""
-    results = {}
-    
-    # For each vulnerability type
-    for vuln_type in df['vuln_type'].unique():
-        # Filter to just this vulnerability type
-        type_df = df[df['vuln_type'] == vuln_type]
-        
-        # Count occurrences of each product
-        service_counts = type_df['product'].value_counts().head(10)
-        
-        results[vuln_type] = service_counts
-        
-        # Generate visualization
-        plt.figure(figsize=(12, 6))
-        service_counts.plot(kind='bar')
-        plt.title(f"Top Services Affected by {vuln_type}")
-        plt.xlabel("Service")
-        plt.ylabel("Count")
-        plt.tight_layout()
-        plt.savefig(f"analysis/services_affected_by_{vuln_type.replace(' ', '_').lower()}.png")
-    
-    return results
-
 def extract_mitigation_info(references):
     """Extract potential mitigation information from references."""
     # This is a placeholder - you would implement logic to parse references
@@ -143,12 +120,41 @@ def extract_mitigation_info(references):
         mitigation_info['workaround_available'] = True
     return mitigation_info
 
+from data_processing.cwe_vulnerability_types import get_vulnerability_type
+
+# TODO: Improve For Production
 def map_cwe_to_vuln_type(cwe):
-    """Map CWE ID to a meaningful vulnerability type category."""
+    """Map CWE ID to a meaningful vulnerability type."""
     if not cwe or not isinstance(cwe, str):
         return 'Unknown'
     
-    return get_vulnerability_type(cwe)
+    # First try the direct mapping
+    vuln_type = get_vulnerability_type(cwe)
+    
+    # If that doesn't work, try the database for additional info
+    if vuln_type == 'Other':
+        db = VulnerabilityDatabase()
+        conn = db.connect()
+        cursor = conn.cursor()
+        cursor.execute("SELECT name FROM weaknesses WHERE cwe_id=?", (cwe,))
+        result = cursor.fetchone()
+        conn.close()
+        
+        if result and result[0]:
+            # Try to categorize based on keywords in the name.  
+            # This is not a long term solution but a quick fix to get a demo working
+            name = result[0].lower()
+            if 'inject' in name:
+                return 'Injection'
+            elif 'buffer' in name or 'overflow' in name:
+                return 'Buffer Overflow'
+            elif 'xss' in name or 'cross site' in name:
+                return 'Cross-site Scripting (XSS)'
+            elif 'bypass' in name:
+                return 'Security Bypass'
+            # Add more keyword checks as needed
+    
+    return vuln_type
 
 def build_type_classifier(X_train, y_train, cat_features, num_features):
     """Build and train a vulnerability type classifier with tuning."""
@@ -183,7 +189,6 @@ def build_type_classifier(X_train, y_train, cat_features, num_features):
         n_jobs=-1,
         verbose=1,
         error_score='raise'
-        # Removed: callback=TimeoutCallback(timeout=1800)
     )
     
     # Set a maximum runtime using a timer instead
@@ -219,130 +224,72 @@ def build_type_classifier(X_train, y_train, cat_features, num_features):
         default_pipeline.fit(X_train, y_train)
         return default_pipeline
 
-def analyze_vulnerability_landscape(df):
-    """Analyze the vulnerability landscape including prevalence and severity."""
-    # Vulnerability type distribution (prevalence)
-    plt.figure(figsize=(14, 8))
-    type_counts = df["vuln_type"].value_counts()
-    
-    # Fix for deprecation warning
-    sns.barplot(y=type_counts.index, x=type_counts.values, color="steelblue")
-    plt.title("Distribution of Vulnerability Types (Prevalence)")
-    plt.xlabel("Count")
-    plt.ylabel("Vulnerability Type")
-    plt.tight_layout()
-    plt.savefig("analysis/vuln_type_distribution.png")
-    
-    # Severity distribution within each vulnerability type
-    plt.figure(figsize=(16, 10))
-    crosstab = pd.crosstab(df["vuln_type"], df["severity"])
-    crosstab_pct = crosstab.div(crosstab.sum(axis=1), axis=0)
-    
-    crosstab_pct.plot(kind="barh", stacked=True, colormap="viridis")
-    plt.title("Severity Distribution by Vulnerability Type")
-    plt.xlabel("Proportion")
-    plt.ylabel("Vulnerability Type")
-    plt.legend(title="Severity")
-    plt.tight_layout()
-    plt.savefig("analysis/vuln_type_severity_distribution.png")
-    
-    # Calculate the weighted risk score for each vulnerability type
-    # This combines prevalence and severity into a single metric
-    severity_weights = {
-        "Low": 1,
-        "Medium": 3,
-        "High": 6,
-        "Critical": 10
-    }
-    
-    # Create a dataframe with type, count and weighted score
-    risk_scores = []
-    for vuln_type in df["vuln_type"].unique():
-        type_df = df[df["vuln_type"] == vuln_type]
-        count = len(type_df)
-        
-        # Handle missing values more robustly
-        valid_severities = type_df["severity"].dropna()
-        if len(valid_severities) > 0:
-            # Convert to string type before mapping to avoid categorical issues
-            severity_values = valid_severities.astype(str).map(severity_weights).fillna(0) 
-            weighted_score = sum(severity_values) / len(valid_severities)
-        else:
-            weighted_score = 0
-        
-        risk_scores.append({
-            "vuln_type": vuln_type,
-            "count": count,
-            "avg_severity_weight": weighted_score,
-            "risk_score": count * weighted_score  # Combines prevalence and severity
-        })
-    
-    risk_df = pd.DataFrame(risk_scores).sort_values("risk_score", ascending=False)
-    
-    # Plot combined risk score
-    plt.figure(figsize=(14, 8))
-    sns.barplot(y="vuln_type", x="risk_score", data=risk_df, color="purple")
-    plt.title("Combined Risk Score by Vulnerability Type (Prevalence × Severity)")
-    plt.xlabel("Risk Score")
-    plt.ylabel("Vulnerability Type")
-    plt.tight_layout()
-    plt.savefig("analysis/vuln_type_risk_score.png")
-    
-    return risk_df
-
 def main(skip_training=False):
-    # IMPORTANT: Make skip_training check at the very beginning
+    """
+    Main function to prepare data and train or load a vulnerability type classifier.
     
+    Args:
+        skip_training (bool): If True, attempts to load a pre-trained model instead of training
+                              a new one. If loading fails, falls back to training. Defaults to False.
+    
+    Returns:
+        tuple: The trained model and processed dataset
+    """
+    print(f"Running vulnerability classifier with skip_training={skip_training}")
+    
+    # Load and prepare data
     X_train, X_test, y_train_type, y_test_type, y_train_sev, y_test_sev, df, cat_features, num_features = prepare_data()
-    #skip_training = True
-    if skip_training == False:
-        # Build vulnerability type classifier
-        print("Building vulnerability type classifier...")
-        type_model = build_type_classifier(X_train, y_train_type, cat_features, num_features)
+    
+    # Handle model (either load existing or train new)
+    model_path = "models/vuln_type_classifier.joblib"
+    model = None
+    
+    if skip_training:
+        # Try to load existing model
+        print("Attempting to load pre-trained model...")
+        try:
+            if os.path.exists(model_path):
+                model = joblib.load(model_path)
+                print(f"Successfully loaded model from {model_path}")
+            else:
+                print(f"No model found at {model_path}")
+                model = None
+        except Exception as e:
+            print(f"Error loading model: {e}")
+            model = None
+    
+    # Train new model if needed (either by choice or because loading failed)
+    if model is None:
+        print("Training new vulnerability type classifier...")
+        model = build_type_classifier(X_train, y_train_type, cat_features, num_features)
         
         # Evaluate model
         print("Evaluating vulnerability type classifier...")
-        y_pred_type = type_model.predict(X_test)
+        y_pred_type = model.predict(X_test)
         print("Classification Report for Vulnerability Types:")
         print(classification_report(y_test_type, y_pred_type))
         
         # Save model
-        model_path = "models/vuln_type_classifier.joblib"
-        joblib.dump(type_model, model_path)
+        os.makedirs(os.path.dirname(model_path), exist_ok=True)
+        joblib.dump(model, model_path)
         print(f"Type classifier saved to {model_path}")
-    else:
-        print("Skipping training, loading existing model (if available)...")
-        try:
-            # Load the existing model if available
-            model_path = "models/vuln_type_classifier.joblib"
-            if os.path.exists(model_path):
-                joblib.load(model_path)
-                print(f"Loaded existing model from {model_path}")
-            else:
-                print(f"No existing model found at {model_path}, but continuing with analysis")
-        except Exception as e:
-            print(f"Error loading model: {e}, but continuing with analysis")
-    
-    # Analyze vulnerability landscape (prevalence and severity)
-    print("Analyzing vulnerability landscape...")
-    risk_df = analyze_vulnerability_landscape(df)
-    print("\nTop 5 vulnerability types by combined risk score:")
-    print(risk_df[["vuln_type", "count", "avg_severity_weight", "risk_score"]].head(5))
     
     # Save the complete dataset with classifications for further analysis
     output_path = "analysis/classified_vulnerabilities_with_details.csv"
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
     df.to_csv(output_path, index=False)
     print(f"Complete classified dataset with details saved to {output_path}")
     
-    # Save the risk analysis results
-    risk_df.to_csv("analysis/vulnerability_risk_analysis.csv", index=False)
-    print("Risk analysis saved to analysis/vulnerability_risk_analysis.csv")
+    print("\nVulnerability classification complete.")
+    print("For detailed analysis, run: python analysis/advanced_vulnerability_analysis.py")
+    
+    return model, df
 
 
 if __name__ == "__main__":
-    #analyze_vulnerability_landscape
-    # Check for command line arguments to skip training
-    if len(sys.argv) > 1 and sys.argv[1] == "--skip-training":
+    # The skip-training argument is still useful as an endpoint for model functions
+    # It allows users to quickly use an existing model without retraining
+    if len(sys.argv) > 1 and "--skip-training" in sys.argv:
         main(skip_training=True)
     else:
         main(skip_training=False)

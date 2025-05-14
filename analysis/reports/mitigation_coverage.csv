@@ -1,0 +1,43 @@
+vuln_type,coverage_pct,total_vulns
+SSRF,0.8119995488891396,8867
+Security Bypass,51.508785332314744,5236
+Buffer Overflow,67.56011376368181,69618
+Authentication Issues,100.0,10368
+Certificate Validation,100.0,2326
+Cleartext Transmission,100.0,1497
+Code Injection,100.0,5786
+Access Control Issues,100.0,23751
+Cross-Site Request Forgery (CSRF),100.0,10478
+Cross-site Scripting (XSS),100.0,68199
+Deserialization of Untrusted Data,100.0,5091
+Double Free,100.0,3511
+Expression Language Injection,100.0,233
+Hardcoded Credentials,100.0,2399
+Heap-based Buffer Overflow,100.0,12695
+Broken/Risky Crypto,100.0,1997
+Improper Input Validation,100.0,22142
+Inadequate Encryption Strength,100.0,824
+Injection,100.0,5668
+Information Disclosure,100.0,12764
+Memory Leak,100.0,5923
+NULL Pointer Dereference,100.0,19158
+Open Redirect,100.0,2303
+Link Following,100.0,3672
+Out-of-bounds Read,100.0,32779
+Out-of-bounds Write,100.0,48609
+Privilege Escalation,100.0,11374
+Path Traversal,100.0,13998
+Race Condition,100.0,8076
+Resource Allocation,100.0,4177
+Resource Exhaustion,100.0,13523
+Command Injection,100.0,17269
+SQL Injection,100.0,16646
+Session Fixation,100.0,587
+Stack-based Buffer Overflow,100.0,11441
+Unrestricted File Upload,100.0,5317
+Use After Free,100.0,27065
+Weak Credentials,100.0,2633
+Weak Random,100.0,1610
+Weak Salt,100.0,7
+XML Injection,100.0,218
+XXE,100.0,1790

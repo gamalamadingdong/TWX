@@ -1,0 +1,43 @@
+vuln_type,Critical,High,Low,Medium
+Access Control Issues,0.0,1611.0,11590.0,10550.0
+Authentication Issues,2.0,1718.0,2077.0,6571.0
+Broken/Risky Crypto,0.0,230.0,1017.0,750.0
+Buffer Overflow,3.0,5313.0,13120.0,51182.0
+Certificate Validation,0.0,564.0,925.0,837.0
+Cleartext Transmission,0.0,230.0,599.0,668.0
+Code Injection,1.0,395.0,2731.0,2659.0
+Command Injection,1.0,1479.0,6265.0,9524.0
+Cross-Site Request Forgery (CSRF),5.0,1810.0,6261.0,2402.0
+Cross-site Scripting (XSS),20.0,9646.0,49422.0,9111.0
+Deserialization of Untrusted Data,1.0,672.0,1156.0,3262.0
+Double Free,0.0,1092.0,335.0,2084.0
+Expression Language Injection,0.0,21.0,14.0,198.0
+Hardcoded Credentials,0.0,405.0,536.0,1458.0
+Heap-based Buffer Overflow,0.0,369.0,1274.0,11052.0
+Improper Input Validation,8.0,2163.0,7550.0,12421.0
+Inadequate Encryption Strength,0.0,172.0,394.0,258.0
+Information Disclosure,0.0,1335.0,8630.0,2799.0
+Injection,8.0,492.0,2627.0,2541.0
+Link Following,0.0,310.0,1021.0,2341.0
+Memory Leak,3.0,3750.0,1018.0,1152.0
+NULL Pointer Dereference,8.0,9675.0,3847.0,5628.0
+Open Redirect,0.0,432.0,1660.0,211.0
+Out-of-bounds Read,3.0,4084.0,9007.0,19685.0
+Out-of-bounds Write,28.0,8093.0,7555.0,32933.0
+Path Traversal,8.0,2012.0,7090.0,4888.0
+Privilege Escalation,0.0,699.0,4928.0,5747.0
+Race Condition,0.0,452.0,3166.0,4458.0
+Resource Allocation,0.0,1063.0,1469.0,1645.0
+Resource Exhaustion,0.0,1386.0,4867.0,7270.0
+SQL Injection,4.0,3494.0,5856.0,7292.0
+SSRF,0.0,571.0,1819.0,6477.0
+Security Bypass,0.0,347.0,2924.0,1965.0
+Session Fixation,0.0,50.0,151.0,386.0
+Stack-based Buffer Overflow,0.0,314.0,1322.0,9805.0
+Unrestricted File Upload,0.0,1132.0,1555.0,2630.0
+Use After Free,0.0,6342.0,3143.0,17580.0
+Weak Credentials,0.0,415.0,863.0,1355.0
+Weak Random,0.0,208.0,214.0,1188.0
+Weak Salt,0.0,0.0,7.0,0.0
+XML Injection,0.0,20.0,94.0,104.0
+XXE,7.0,353.0,845.0,585.0
