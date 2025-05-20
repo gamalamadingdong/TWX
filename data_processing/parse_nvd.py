@@ -1,366 +1,487 @@
 """
-Parse and normalize NVD JSON data, including KEV and vulnrichment enrichment fields.
-
-This script loads raw NVD JSON, extracts and flattens all relevant fields (including enrichment),
-and outputs a unified, analysis-ready JSON file. This supports unbiased grouping, classification,
-and analytics as described in the project plan.
-
-Why this matters:
-- NVD data includes additional enrichment (CVSS, CPE, references) not always present in CVE.
-- Ensures all vulnerability data is consistent and ready for downstream analytics and modeling.
+Parser for NVD vulnerability data in both legacy and API formats.
+Supports TWX's goal of unbiasing vulnerability data through proper classification.
 """
 
 import json
-from typing import List, Dict, Any
+import re
+import logging
+from typing import Dict, List, Any, Optional
 
-def load_json(path: str) -> Any:
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
+logger = logging.getLogger(__name__)
 
-def extract_cwe(problemtype: dict) -> List[str]:
-    """Extract CWE(s) from the problemType field."""
-    cwes = []
-    if not problemtype:
-        return cwes
-    for desc in problemtype.get("problemtype_data", []):
-        for item in desc.get("description", []):
-            val = item.get("value")
-            if val and val.startswith("CWE-"):
-                cwes.append(val)
-    return cwes
-
-def extract_cvss(nvd_item: dict) -> Dict[str, Any]:
-    """Enhanced CVSS extraction with detailed vector parsing."""
-    impact = nvd_item.get("impact", {})
-    cvss = {}
+def parse_nvd_record(nvd_item: Dict) -> Dict:
+    """
+    Parse an NVD vulnerability item, supporting both legacy and API formats.
     
-    # Try V3 first, then fall back to V2
-    for version_key, cvss_key in [("baseMetricV3", "cvssV3"), ("baseMetricV2", "cvssV2")]:
-        metric = impact.get(version_key)
-        if metric:
-            cvss_data = metric.get(cvss_key, {})
-            cvss = {
-                "version": cvss_data.get("version"),
-                "base_score": cvss_data.get("baseScore"),
-                "vector": cvss_data.get("vectorString"),
-                "exploitability_score": metric.get("exploitabilityScore"),
-                "impact_score": metric.get("impactScore"),
-                "source": "nvd"
-            }
-            break
+    This function extracts comprehensive vulnerability information from NVD records
+    to support TWX's goal of unbiasing vulnerability data through proper classification.
     
-    # Parse the vector string into individual components
-    if cvss and "vector" in cvss and cvss["vector"]:
-        vector_parts = {}
-        vector_str = cvss["vector"]
+    Args:
+        nvd_item: A single vulnerability item from NVD data feed
         
-        # Handle the CVSS:3.x/AV:N/AC:L/... format
-        if "/" in vector_str:
-            parts = vector_str.split("/")
-            for part in parts:
-                if ":" in part:
-                    key, value = part.split(":", 1)
-                    vector_parts[key] = value
+    Returns:
+        Dictionary containing normalized vulnerability data
+    """
+    try:
+        # Determine format - legacy (CVE_Items) or new API format
+        is_legacy_format = "cve" in nvd_item and "CVE_data_meta" in nvd_item.get("cve", {})
         
-        # Extract specific vector components
-        cvss["attack_vector"] = vector_parts.get("AV")
-        cvss["attack_complexity"] = vector_parts.get("AC")
-        cvss["privileges_required"] = vector_parts.get("PR")
-        cvss["user_interaction"] = vector_parts.get("UI")
-        cvss["scope"] = vector_parts.get("S")
-        cvss["confidentiality"] = vector_parts.get("C")
-        cvss["integrity"] = vector_parts.get("I")
-        cvss["availability"] = vector_parts.get("A")
+        # Extract CVE ID based on format
+        if is_legacy_format:
+            cve_id = nvd_item.get("cve", {}).get("CVE_data_meta", {}).get("ID")
+        else:  # New API format
+            cve_id = nvd_item.get("cve", {}).get("id")
         
-        # Add normalized fields for classification
-        cvss["av"] = map_attack_vector(vector_parts.get("AV"))
-        cvss["ac"] = map_attack_complexity(vector_parts.get("AC"))
-        cvss["pr"] = map_privileges_required(vector_parts.get("PR"))
-        cvss["ui"] = map_user_interaction(vector_parts.get("UI"))
-        cvss["s"] = map_scope(vector_parts.get("S"))
-        cvss["c"] = map_cia_impact(vector_parts.get("C"))
-        cvss["i"] = map_cia_impact(vector_parts.get("I"))
-        cvss["a"] = map_cia_impact(vector_parts.get("A"))
-    
-    return cvss
-
-def extract_products(configurations: dict) -> List[Dict[str, str]]:
-    """Enhanced product extraction with version ranges and platform details."""
-    products = []
-    for node in configurations.get("nodes", []):
-        for cpe in node.get("cpe_match", []):
-            cpe23 = cpe.get("cpe23Uri", "")
-            parts = cpe23.split(":")
+        # Verify we have an ID before proceeding
+        if not cve_id:
+            return {"parse_error": "Missing CVE ID in NVD record"}
+        
+        # Extract description based on format
+        description = ""
+        if is_legacy_format:
+            desc_data = nvd_item.get("cve", {}).get("description", {}).get("description_data", [])
+            for desc in desc_data:
+                if desc.get("lang") == "en":
+                    description = desc.get("value", "")
+                    break
+        else:  # New API format
+            descriptions = nvd_item.get("cve", {}).get("descriptions", [])
+            for desc in descriptions:
+                if desc.get("lang") == "en":
+                    description = desc.get("value", "")
+                    break
+        
+        # Extract CWE information
+        cwes = []
+        if is_legacy_format:
+            problem_type_data = nvd_item.get("cve", {}).get("problemtype", {}).get("problemtype_data", [])
+            for problem in problem_type_data:
+                for desc in problem.get("description", []):
+                    if "value" in desc and desc.get("value", "").startswith("CWE-"):
+                        cwes.append(desc.get("value"))
+        else:  # New API format
+            vuln_data = nvd_item.get("cve", {})
+            if "weaknesses" in vuln_data:
+                for weakness in vuln_data["weaknesses"]:
+                    for desc in weakness.get("description", []):
+                        if "value" in desc and desc.get("value", "").startswith("CWE-"):
+                            cwes.append(desc.get("value"))
+        
+        # Extract CVSS data based on format
+        cvss_data = {}
+        if is_legacy_format:
+            impact = nvd_item.get("impact", {})
             
-            if len(parts) >= 5:
-                product_info = {
-                    "vendor": parts[3],
-                    "product": parts[4],
-                    "version": parts[5] if len(parts) > 5 else "",
-                    "status": "affected" if cpe.get("vulnerable", True) else "not_affected"
+            # Try CVSS v3 first
+            if "baseMetricV3" in impact:
+                cvss_v3 = impact.get("baseMetricV3", {}).get("cvssV3", {})
+                if cvss_v3:
+                    cvss_data = {
+                        "version": "3.1" if cvss_v3.get("version") == "3.1" else "3.0",
+                        "vector": cvss_v3.get("vectorString", ""),
+                        "base_score": cvss_v3.get("baseScore"),
+                        "base_severity": cvss_v3.get("baseSeverity", ""),
+                        "attack_vector": cvss_v3.get("attackVector", ""),
+                        "attack_complexity": cvss_v3.get("attackComplexity", ""),
+                        "privileges_required": cvss_v3.get("privilegesRequired", ""),
+                        "user_interaction": cvss_v3.get("userInteraction", ""),
+                        "scope": cvss_v3.get("scope", ""),
+                        "confidentiality_impact": cvss_v3.get("confidentialityImpact", ""),
+                        "integrity_impact": cvss_v3.get("integrityImpact", ""),
+                        "availability_impact": cvss_v3.get("availabilityImpact", ""),
+                        "exploitability_score": impact.get("baseMetricV3", {}).get("exploitabilityScore"),
+                        "impact_score": impact.get("baseMetricV3", {}).get("impactScore")
+                    }
+            
+            # Fall back to CVSS v2 if needed
+            elif "baseMetricV2" in impact and not cvss_data:
+                cvss_v2 = impact.get("baseMetricV2", {}).get("cvssV2", {})
+                if cvss_v2:
+                    cvss_data = {
+                        "version": "2.0",
+                        "vector": cvss_v2.get("vectorString", ""),
+                        "base_score": cvss_v2.get("baseScore"),
+                        "base_severity": _cvss2_to_severity(cvss_v2.get("baseScore")),
+                        "access_vector": cvss_v2.get("accessVector", ""),
+                        "access_complexity": cvss_v2.get("accessComplexity", ""),
+                        "authentication": cvss_v2.get("authentication", ""),
+                        "confidentiality_impact": cvss_v2.get("confidentialityImpact", ""),
+                        "integrity_impact": cvss_v2.get("integrityImpact", ""),
+                        "availability_impact": cvss_v2.get("availabilityImpact", ""),
+                        "exploitability_score": impact.get("baseMetricV2", {}).get("exploitabilityScore"),
+                        "impact_score": impact.get("baseMetricV2", {}).get("impactScore")
+                    }
+        else:  # New API format
+            metrics = nvd_item.get("cve", {}).get("metrics", {})
+            
+            # Try CVSS v3.1 first (preferred)
+            if "cvssMetricV31" in metrics and metrics["cvssMetricV31"]:
+                cvss_v31 = metrics["cvssMetricV31"][0]
+                cvss_data = {
+                    "version": "3.1",
+                    "vector": cvss_v31.get("cvssData", {}).get("vectorString", ""),
+                    "base_score": cvss_v31.get("cvssData", {}).get("baseScore"),
+                    "base_severity": cvss_v31.get("cvssData", {}).get("baseSeverity", ""),
+                    "attack_vector": cvss_v31.get("cvssData", {}).get("attackVector", ""),
+                    "attack_complexity": cvss_v31.get("cvssData", {}).get("attackComplexity", ""),
+                    "privileges_required": cvss_v31.get("cvssData", {}).get("privilegesRequired", ""),
+                    "user_interaction": cvss_v31.get("cvssData", {}).get("userInteraction", ""),
+                    "scope": cvss_v31.get("cvssData", {}).get("scope", ""),
+                    "confidentiality_impact": cvss_v31.get("cvssData", {}).get("confidentialityImpact", ""),
+                    "integrity_impact": cvss_v31.get("cvssData", {}).get("integrityImpact", ""),
+                    "availability_impact": cvss_v31.get("cvssData", {}).get("availabilityImpact", ""),
+                    "exploitability_score": cvss_v31.get("exploitabilityScore"),
+                    "impact_score": cvss_v31.get("impactScore")
+                }
+            
+            # Fall back to CVSS v3.0 if needed
+            elif "cvssMetricV30" in metrics and metrics["cvssMetricV30"] and not cvss_data:
+                cvss_v30 = metrics["cvssMetricV30"][0]
+                cvss_data = {
+                    "version": "3.0",
+                    "vector": cvss_v30.get("cvssData", {}).get("vectorString", ""),
+                    "base_score": cvss_v30.get("cvssData", {}).get("baseScore"),
+                    "base_severity": cvss_v30.get("cvssData", {}).get("baseSeverity", ""),
+                    "attack_vector": cvss_v30.get("cvssData", {}).get("attackVector", ""),
+                    "attack_complexity": cvss_v30.get("cvssData", {}).get("attackComplexity", ""),
+                    "privileges_required": cvss_v30.get("cvssData", {}).get("privilegesRequired", ""),
+                    "user_interaction": cvss_v30.get("cvssData", {}).get("userInteraction", ""),
+                    "scope": cvss_v30.get("cvssData", {}).get("scope", ""),
+                    "confidentiality_impact": cvss_v30.get("cvssData", {}).get("confidentialityImpact", ""),
+                    "integrity_impact": cvss_v30.get("cvssData", {}).get("integrityImpact", ""),
+                    "availability_impact": cvss_v30.get("cvssData", {}).get("availabilityImpact", ""),
+                    "exploitability_score": cvss_v30.get("exploitabilityScore"),
+                    "impact_score": cvss_v30.get("impactScore")
+                }
+            
+            # Fall back to CVSS v2.0 if needed
+            elif "cvssMetricV2" in metrics and metrics["cvssMetricV2"] and not cvss_data:
+                cvss_v2 = metrics["cvssMetricV2"][0]
+                cvss_data = {
+                    "version": "2.0",
+                    "vector": cvss_v2.get("cvssData", {}).get("vectorString", ""),
+                    "base_score": cvss_v2.get("cvssData", {}).get("baseScore"),
+                    "base_severity": _cvss2_to_severity(cvss_v2.get("cvssData", {}).get("baseScore")),
+                    "access_vector": cvss_v2.get("cvssData", {}).get("accessVector", ""),
+                    "access_complexity": cvss_v2.get("cvssData", {}).get("accessComplexity", ""),
+                    "authentication": cvss_v2.get("cvssData", {}).get("authentication", ""),
+                    "confidentiality_impact": cvss_v2.get("cvssData", {}).get("confidentialityImpact", ""),
+                    "integrity_impact": cvss_v2.get("cvssData", {}).get("integrityImpact", ""),
+                    "availability_impact": cvss_v2.get("cvssData", {}).get("availabilityImpact", ""),
+                    "exploitability_score": cvss_v2.get("exploitabilityScore"),
+                    "impact_score": cvss_v2.get("impactScore")
+                }
+        
+        # Extract references based on format
+        references = []
+        if is_legacy_format:
+            ref_data = nvd_item.get("cve", {}).get("references", {}).get("reference_data", [])
+            for ref in ref_data:
+                reference = {
+                    "url": ref.get("url", ""),
+                    "name": ref.get("name", ref.get("url", "")),
+                    "tags": ref.get("tags", [])
                 }
                 
-                # Extract platform details if present
-                if len(parts) > 10 and parts[10]:
-                    product_info["platform"] = parts[10]
+                # Check if this is an exploit reference
+                is_exploit = any(tag in ["exploit", "Exploit", "Attacks"] for tag in ref.get("tags", []))
+                url_lower = ref.get("url", "").lower()
+                if "exploit" in url_lower or "poc" in url_lower or "proof" in url_lower:
+                    is_exploit = True
+                    
+                reference["is_exploit"] = is_exploit
+                references.append(reference)
+        else:  # New API format
+            ref_data = nvd_item.get("cve", {}).get("references", [])
+            for ref in ref_data:
+                reference = {
+                    "url": ref.get("url", ""),
+                    "tags": ref.get("tags", [])
+                }
                 
-                # Extract version range information
-                if "versionStartIncluding" in cpe:
-                    product_info["version_start_including"] = cpe["versionStartIncluding"]
-                if "versionStartExcluding" in cpe:
-                    product_info["version_start_excluding"] = cpe["versionStartExcluding"]
-                if "versionEndIncluding" in cpe:
-                    product_info["version_end_including"] = cpe["versionEndIncluding"]
-                if "versionEndExcluding" in cpe:
-                    product_info["version_end_excluding"] = cpe["versionEndExcluding"]
+                # Check if this is an exploit reference
+                is_exploit = any(tag in ["exploit", "Exploit", "Attacks"] for tag in ref.get("tags", []))
+                url_lower = ref.get("url", "").lower()
+                if "exploit" in url_lower or "poc" in url_lower or "proof" in url_lower:
+                    is_exploit = True
+                    
+                reference["is_exploit"] = is_exploit
+                references.append(reference)
+        
+        # Extract affected products (CPEs) based on format
+        products = []
+        if is_legacy_format:
+            nodes = nvd_item.get("configurations", {}).get("nodes", [])
+            for node in nodes:
+                if "cpe_match" in node:
+                    for cpe_match in node.get("cpe_match", []):
+                        cpe_uri = cpe_match.get("cpe23Uri", "")
+                        if cpe_uri:
+                            # Parse CPE URI format: cpe:2.3:part:vendor:product:version:...
+                            parts = cpe_uri.split(':')
+                            if len(parts) > 5:
+                                # Extract product details from CPE URI
+                                product_info = {
+                                    "vendor": parts[3] or "n/a",
+                                    "product": parts[4] or "n/a",
+                                    "version": parts[5] or "any"
+                                }
+                                
+                                # Add version range info if available
+                                if "versionStartIncluding" in cpe_match:
+                                    product_info["version_start_including"] = cpe_match["versionStartIncluding"]
+                                if "versionStartExcluding" in cpe_match:
+                                    product_info["version_start_excluding"] = cpe_match["versionStartExcluding"]
+                                if "versionEndIncluding" in cpe_match:
+                                    product_info["version_end_including"] = cpe_match["versionEndIncluding"]
+                                if "versionEndExcluding" in cpe_match:
+                                    product_info["version_end_excluding"] = cpe_match["versionEndExcluding"]
+                                    
+                                # Check if vulnerable
+                                product_info["vulnerable"] = cpe_match.get("vulnerable", True)
+                                
+                                # Add to products list
+                                products.append(product_info)
                 
-                products.append(product_info)
-    
-    return products
-
-def extract_references(cve: dict) -> List[Dict[str, str]]:
-    """Enhanced reference extraction with type classification."""
-    references = []
-    
-    for ref in cve.get("references", {}).get("reference_data", []):
-        url = ref.get("url", "")
-        ref_type = "unknown"
+                # Handle nested nodes
+                if "children" in node:
+                    for child in node.get("children", []):
+                        if "cpe_match" in child:
+                            for cpe_match in child.get("cpe_match", []):
+                                cpe_uri = cpe_match.get("cpe23Uri", "")
+                                if cpe_uri:
+                                    # Parse CPE URI
+                                    parts = cpe_uri.split(':')
+                                    if len(parts) > 5:
+                                        # Extract product details from CPE URI
+                                        product_info = {
+                                            "vendor": parts[3] or "n/a",
+                                            "product": parts[4] or "n/a",
+                                            "version": parts[5] or "any"
+                                        }
+                                        
+                                        # Add version range info if available
+                                        if "versionStartIncluding" in cpe_match:
+                                            product_info["version_start_including"] = cpe_match["versionStartIncluding"]
+                                        if "versionStartExcluding" in cpe_match:
+                                            product_info["version_start_excluding"] = cpe_match["versionStartExcluding"]
+                                        if "versionEndIncluding" in cpe_match:
+                                            product_info["version_end_including"] = cpe_match["versionEndIncluding"]
+                                        if "versionEndExcluding" in cpe_match:
+                                            product_info["version_end_excluding"] = cpe_match["versionEndExcluding"]
+                                            
+                                        # Check if vulnerable
+                                        product_info["vulnerable"] = cpe_match.get("vulnerable", True)
+                                        
+                                        # Add to products list
+                                        products.append(product_info)
+        else:  # New API format
+            if "configurations" in nvd_item:
+                for config_node in nvd_item["configurations"]:
+                    for node in config_node.get("nodes", []):
+                        for cpe_match in node.get("cpeMatch", []):
+                            cpe_uri = cpe_match.get("criteria", "")
+                            if cpe_uri:
+                                # Parse CPE URI format: cpe:2.3:part:vendor:product:version:...
+                                parts = cpe_uri.split(':')
+                                if len(parts) > 5:
+                                    # Extract product details from CPE URI
+                                    product_info = {
+                                        "vendor": parts[3] or "n/a",
+                                        "product": parts[4] or "n/a",
+                                        "version": parts[5] or "any"
+                                    }
+                                    
+                                    # Add version range info if available
+                                    if "versionStartIncluding" in cpe_match:
+                                        product_info["version_start_including"] = cpe_match["versionStartIncluding"]
+                                    if "versionStartExcluding" in cpe_match:
+                                        product_info["version_start_excluding"] = cpe_match["versionStartExcluding"]
+                                    if "versionEndIncluding" in cpe_match:
+                                        product_info["version_end_including"] = cpe_match["versionEndIncluding"]
+                                    if "versionEndExcluding" in cpe_match:
+                                        product_info["version_end_excluding"] = cpe_match["versionEndExcluding"]
+                                        
+                                    # Check if vulnerable
+                                    product_info["vulnerable"] = cpe_match.get("vulnerable", True)
+                                    
+                                    # Add to products list
+                                    products.append(product_info)
         
-        # Classify reference types based on content
-        if is_exploit_reference(url):
-            ref_type = "exploit"
-        elif is_patch_reference(url):
-            ref_type = "patch"
-        elif is_vendor_reference(url):
-            ref_type = "vendor"
+        # Check for KEV status
+        is_kev = False
+        if is_legacy_format:
+            # Check legacy format for KEV info (may be in custom structures)
+            pass
+        else:  # New API format
+            # Check for KEV information in the new API format
+            if "cisaActionDue" in nvd_item or "cisaExploitAdd" in nvd_item or "cisaRequiredAction" in nvd_item:
+                is_kev = True
+                
+        # Create cisa_kev data if needed
+        cisa_kev = {}
+        if is_kev:
+            cisa_kev = {
+                "knownExploited": True,
+                "dateAdded": nvd_item.get("cisaExploitAdd", ""),
+                "requiredAction": nvd_item.get("cisaRequiredAction", ""),
+                "dueDate": nvd_item.get("cisaActionDue", "")
+            }
         
-        references.append({
-            "url": url,
-            "source": ref.get("name", ""),
-            "type": ref_type,
-            "tags": ref.get("tags", [])
-        })
-    
-    return references
-
-def extract_vulnrichment(cve: dict) -> Dict[str, Any]:
-    """Enhanced extraction of vulnrichment and KEV fields."""
-    v = cve.get("vulnrichment", {})
-    cisa_kev = v.get("cisaKev", {})
-    
-    result = {
-        "known_exploited": cisa_kev.get("known_exploited", False),
-        "cisa_fields": {
-            "kev_date_added": cisa_kev.get("dateAdded"),
-            "kev_vendor_project": cisa_kev.get("vendorProject"),
-            "kev_product": cisa_kev.get("product"),
-            "kev_notes": cisa_kev.get("notes"),
-            "kev_required_action": cisa_kev.get("requiredAction"),
-            "kev_due_date": cisa_kev.get("dueDate")
+        # Extract publish and modified dates
+        published_date = ""
+        modified_date = ""
+        
+        if is_legacy_format:
+            published_date = nvd_item.get("publishedDate", "")
+            modified_date = nvd_item.get("lastModifiedDate", "")
+        else:  # New API format
+            published_date = nvd_item.get("published", "")
+            modified_date = nvd_item.get("lastModified", "")
+        
+        # Create normalized record
+        normalized_record = {
+            "id": cve_id,
+            "description": description,
+            "cwe": cwes,
+            "products": products,
+            "product_count": len(products),
+            "product_names": list(set(p["product"] for p in products if p["product"] != "n/a")),
+            "vendors": list(set(p["vendor"] for p in products if p["vendor"] != "n/a")),
+            "cvss": cvss_data,
+            "base_score": cvss_data.get("base_score", 0),
+            "exploitability_score": cvss_data.get("exploitability_score", 0),
+            "impact_score": cvss_data.get("impact_score", 0),
+            "severity": cvss_data.get("base_severity", ""),
+            "references": references,
+            "reference_count": len(references),
+            "exploit_references": [ref for ref in references if ref.get("is_exploit", False)],
+            "has_exploit": any(ref.get("is_exploit", False) for ref in references),
+            "known_exploited": is_kev,
+            "published": published_date,
+            "modified": modified_date,
+            "published_date": published_date,
+            "modified_date": modified_date,
+            "vulnrichment": {
+                "cisaKev": cisa_kev if is_kev else {}
+            },
+            "source": "nvd_legacy" if is_legacy_format else "nvd_api"
         }
-    }
-    
-    # Extract EPSS score if present
-    if "epss" in v:
-        result["epss_score"] = v["epss"].get("score")
-        result["epss_percentile"] = v["epss"].get("percentile")
-    
-    # Store the raw vulnrichment data for future reference
-    result["vulnrichment"] = v
-    
-    return result
-
-def parse_nvd_record(item: dict) -> dict:
-    """Enhanced parser for NVD records with more comprehensive data extraction."""
-    cve = item.get("cve", {})
-    meta = cve.get("CVE_data_meta", {})
-    
-    # Description (prefer English)
-    descs = cve.get("description", {}).get("description_data", [])
-    description = next((d["value"] for d in descs if d.get("lang") == "en"), "") if descs else ""
-    
-    # Enhanced data extraction
-    products = extract_products(item.get("configurations", {}))
-    cwe = extract_cwe(cve.get("problemtype", {}))
-    cvss = extract_cvss(item)
-    references_data = extract_references(cve)
-    reference_urls = [ref["url"] for ref in references_data]
-    
-    enrichment = extract_vulnrichment(cve)
-    
-    # Determine if there's evidence of active exploitation
-    exploit_references = [ref["url"] for ref in references_data if ref["type"] == "exploit"]
-    has_exploit = any([
-        enrichment.get("known_exploited", False),
-        len(exploit_references) > 0,
-        enrichment.get("epss_score", 0) > 0.5  # High EPSS score suggests exploit likelihood
-    ])
-    
-    # Determine if there are vendor advisories
-    has_vendor_advisory = any(ref["type"] == "vendor" for ref in references_data)
-    
-    # Determine if this has a CISA advisory
-    has_cisa_advisory = enrichment.get("known_exploited", False)
-    
-    return {
-        "id": meta.get("ID", item.get("id")),
-        "description": description,
-        "products": products,
-        "cwe": cwe,
-        "capec": [],  # Placeholder for future CAPEC integration
-        "attack_technique": [],  # Placeholder for future ATT&CK integration
-        "cvss": cvss,
-        "references": reference_urls,
-        "references_data": references_data,
-        "reporter": "",  # Not commonly available in NVD
-        "known_exploited": enrichment.get("known_exploited", False),
-        "has_exploit": has_exploit,
-        "has_cisa_advisory": has_cisa_advisory,
-        "has_vendor_advisory": has_vendor_advisory,
-        "exploit_references": exploit_references,
-        "epss_score": enrichment.get("epss_score"),
-        "cisa_fields": enrichment.get("cisa_fields", {}),
-        "vulnrichment": enrichment.get("vulnrichment", {}),
-        "other": {
-            "published": item.get("publishedDate"),
-            "modified": item.get("lastModifiedDate"),
+        
+        return normalized_record
+        
+    except Exception as e:
+        # Return partial record with error information
+        return {
+            "id": nvd_item.get("cve", {}).get("CVE_data_meta", {}).get("ID", 
+                  nvd_item.get("cve", {}).get("id", "Unknown")),
+            "parse_error": f"Error parsing NVD record: {str(e)}",
+            "error_type": str(type(e).__name__)
         }
-    }
 
-# Helper functions for normalized field mapping
-def map_attack_vector(av):
-    """Map CVSS attack vector to normalized value."""
-    if not av:
-        return "Unknown"
-    mapping = {
-        "N": "Network",
-        "A": "Adjacent", 
-        "L": "Local",
-        "P": "Physical"
-    }
-    return mapping.get(av, av)
+def _cvss2_to_severity(score):
+    """Convert CVSS v2 score to severity rating."""
+    if score is None:
+        return ""
+    try:
+        score = float(score)
+        if score < 4.0:
+            return "LOW"
+        elif score < 7.0:
+            return "MEDIUM"
+        elif score < 10.0:
+            return "HIGH"
+        else:
+            return "CRITICAL"
+    except (ValueError, TypeError):
+        return ""
 
-def map_attack_complexity(ac):
-    """Map CVSS attack complexity to normalized value."""
-    if not ac:
-        return "Unknown"
-    mapping = {
-        "L": "Low",
-        "H": "High"
-    }
-    return mapping.get(ac, ac)
-
-def map_privileges_required(pr):
-    """Map CVSS privileges required to normalized value."""
-    if not pr:
-        return "Unknown"
-    mapping = {
-        "N": "None",
-        "L": "Low",
-        "H": "High"
-    }
-    return mapping.get(pr, pr)
-
-def map_user_interaction(ui):
-    """Map CVSS user interaction to normalized value."""
-    if not ui:
-        return "Unknown"
-    mapping = {
-        "N": "None",
-        "R": "Required"
-    }
-    return mapping.get(ui, ui)
-
-def map_scope(s):
-    """Map CVSS scope to normalized value."""
-    if not s:
-        return "Unknown"
-    mapping = {
-        "U": "Unchanged",
-        "C": "Changed"
-    }
-    return mapping.get(s, s)
-
-def map_cia_impact(impact):
-    """Map CVSS CIA impact to normalized value."""
-    if not impact:
-        return "Unknown"
-    mapping = {
-        "N": "None",
-        "L": "Low",
-        "H": "High"
-    }
-    return mapping.get(impact, impact)
-
-def is_exploit_reference(url):
-    """Check if a reference URL suggests exploit information."""
-    if not isinstance(url, str):
-        return False
-        
-    exploit_indicators = [
-        "exploit-db.com",
-        "exploit",
-        "poc",
-        "proof-of-concept",
-        "metasploit",
-        "github.com",  # Many exploits are published on GitHub
-        "vulmon.com/exploitdetails",
-        "packetstormsecurity.com"
-    ]
+def process_nvd_data(data):
+    """
+    Process NVD data file and extract normalized records.
     
-    lower_url = url.lower()
-    return any(indicator in lower_url for indicator in exploit_indicators)
-
-def is_patch_reference(url):
-    """Check if a reference URL suggests patch/fix information."""
-    if not isinstance(url, str):
-        return False
+    Args:
+        data: Raw NVD data (loaded from JSON)
         
-    patch_indicators = [
-        "patch",
-        "update",
-        "fix",
-        "advisory",
-        "security bulletin",
-        "release notes"
-    ]
+    Returns:
+        List of normalized NVD records
+    """
+    normalized_records = []
     
-    lower_url = url.lower()
-    return any(indicator in lower_url for indicator in patch_indicators)
+    # Check if this is a legacy format (CVE_Items) or newer NVD API format
+    if "CVE_Items" in data:
+        items = data["CVE_Items"]
+        format_type = "legacy"
+    elif "vulnerabilities" in data:
+        items = data["vulnerabilities"]
+        format_type = "new_api"
+    else:
+        logger.error("Unknown NVD data format")
+        return []
+    
+    # Process each vulnerability
+    for item in items:
+        try:
+            record = parse_nvd_record(item)
+            normalized_records.append(record)
+        except Exception as e:
+            logger.error(f"Error processing NVD record: {str(e)}")
+            continue
+    
+    return normalized_records
 
-def is_vendor_reference(url):
-    """Check if a reference URL is from a vendor."""
-    if not isinstance(url, str):
-        return False
+def test_parser(file_path):
+    """
+    Test the NVD parser with a specific file and display results.
+    
+    Args:
+        file_path: Path to NVD JSON file
+    
+    Returns:
+        First 5 parsed records
+    """
+    import json
+    
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
         
-    vendor_domains = [
-        "microsoft.com",
-        "apple.com",
-        "oracle.com",
-        "cisco.com",
-        "ibm.com",
-        "vmware.com",
-        "adobe.com",
-        "redhat.com",
-        "debian.org",
-        "canonical.com",
-        "ubuntu.com",
-        "sap.com",
-        "siemens.com"
-    ]
-    
-    lower_url = url.lower()
-    return any(domain in lower_url for domain in vendor_domains)
-
-def parse_all_nvd(input_path: str, output_path: str):
-    """Parse all NVD records in a file and write unified output."""
-    data = load_json(input_path)
-    records = data.get("CVE_Items", [])
-    parsed = [parse_nvd_record(r) for r in records]
-    with open(output_path, "w", encoding="utf-8") as f:
-        json.dump(parsed, f, indent=2)
-    print(f"Parsed {len(parsed)} NVD records and saved to {output_path}")
-
-if __name__ == "__main__":
-    # Example usage: parse NVD JSON to unified format
-    parse_all_nvd("data_collection/raw_data/nvd_data.json", "data_collection/processed_data/nvd_data_parsed.json")
+        # Determine format
+        if "CVE_Items" in data:
+            items = data["CVE_Items"]
+            format_type = "legacy"
+        elif "vulnerabilities" in data:
+            items = data["vulnerabilities"]
+            format_type = "new_api"
+        else:
+            print(f"Unknown NVD data format in {file_path}")
+            return []
+        
+        print(f"Found {len(items)} vulnerability items in {format_type} format")
+        
+        # Parse first 5 items
+        parsed_records = []
+        for i, item in enumerate(items[:5]):
+            print(f"\nProcessing item {i+1}/5")
+            record = parse_nvd_record(item)
+            parsed_records.append(record)
+            
+            # Display key info
+            print(f"CVE ID: {record.get('id')}")
+            print(f"Description: {record.get('description')[:100]}...")
+            print(f"CWE: {record.get('cwe')}")
+            print(f"Products: {len(record.get('products', []))} affected")
+            
+            # Show CVSS if available
+            cvss = record.get('cvss', {})
+            if cvss:
+                print(f"CVSS v{cvss.get('version')} Score: {cvss.get('base_score')} ({cvss.get('base_severity')})")
+        
+        return parsed_records
+        
+    except Exception as e:
+        print(f"Error testing NVD parser: {e}")
+        import traceback
+        traceback.print_exc()
+        return []

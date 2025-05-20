@@ -28,3 +28,4 @@ storage/__pycache__/*
 storage/__pycache__/vulnerability_db.cpython-312.pyc
 **/__pycache__/**
 models/*.md
+logs/

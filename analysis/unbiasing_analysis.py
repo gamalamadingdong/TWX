@@ -90,7 +90,7 @@ def analyze_unbiasing_effect():
 def map_cwe_to_vuln_type(cwe):
     """Map CWE IDs to vulnerability types/categories."""
     # Import this from models/vuln_classifier.py to keep mapping consistent
-    from models.vuln_classifier import map_cwe_to_vuln_type as classifier_map
+    from models.enhanced_classifier import map_cwe_to_vuln_type as classifier_map
     return classifier_map(cwe)
 
 if __name__ == "__main__":

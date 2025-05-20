@@ -8,11 +8,17 @@ import sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from storage.vulnerability_db import VulnerabilityDatabase
 
-def extract_features_from_db(db_path="data_processing/data/twx_vulnerabilities.db", output_path="analysis/classification_data.csv"):
-    """Extract classification features directly from the SQLite database."""
+# Update the extract_features_from_db function to support PostgreSQL
+def extract_features_from_db(db_path=None, output_path="analysis/classification_data.csv", use_postgres=False):
+    """Extract classification features directly from the database."""
     
-    # Initialize database connection
-    db = VulnerabilityDatabase(db_path)
+    # Initialize database connection based on backend
+    if use_postgres:
+        from storage.postgresql_db import PostgresqlVulnerabilityDatabase
+        db = PostgresqlVulnerabilityDatabase()
+    else:
+        from storage.vulnerability_db import VulnerabilityDatabase
+        db = VulnerabilityDatabase(db_path)
     
     # Export data to CSV with all necessary features
     df = db.export_to_csv(output_path)

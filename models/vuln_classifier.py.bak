@@ -1,0 +1,758 @@
+# models/vuln_classifier.py
+import sys
+import os
+
+# Add the project root directory to Python path
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import train_test_split, GridSearchCV, StratifiedKFold
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.feature_selection import SelectFromModel
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.metrics import classification_report, confusion_matrix, f1_score
+import matplotlib.pyplot as plt
+import seaborn as sns
+import joblib
+from time import time
+import re
+from storage.vulnerability_db import VulnerabilityDatabase
+
+def load_validation_data(validation_file="models/validation_sample.csv"):
+    """
+    Load the manually validated vulnerability data.
+    
+    Args:
+        validation_file: Path to the validation CSV file
+        
+    Returns:
+        DataFrame containing validation data
+    """
+    try:
+        validation_df = pd.read_csv(validation_file, low_memory=False)
+        print(f"Loaded {len(validation_df)} manually validated records")
+        
+        # Check if validation data has the required column
+        if 'validated_type' not in validation_df.columns:
+            print(f"Warning: 'validated_type' column missing from validation data")
+            return None
+            
+        # Check how many records have validated types
+        valid_count = validation_df['validated_type'].notnull().sum()
+        print(f"Found {valid_count} records with validated vulnerability types")
+        
+        return validation_df
+    except Exception as e:
+        print(f"Error loading validation data: {e}")
+        return None
+
+def prepare_data(data_path="analysis/classification_data.csv", validation_file="models/validation_sample.csv"):
+    """
+    Load and prepare data for vulnerability type classification with improved NaN handling.
+    """
+    print("Loading main dataset...")
+    df = pd.read_csv(data_path, low_memory=False, parse_dates=['published_date', 'modified_date'])
+    
+    # Check for NaN values in the dataset before processing
+    nan_counts = df.isna().sum()
+    print("NaN counts before preprocessing:")
+    for col, count in nan_counts[nan_counts > 0].items():
+        print(f"  {col}: {count} ({count/len(df)*100:.1f}%)")
+    
+    # Load validation data
+    validation_df = load_validation_data(validation_file)
+    
+    # Enhanced feature selection based on vulnerability domain expertise
+    cat_features = [
+        "cwe", "cwe_name", "cwe_category",  # CWE details provide strong signal
+        "vendor", "product",                # Target information
+        "av", "ac", "pr", "ui", "s", "c", "i", "a",  # CVSS vector components
+        "known_exploited", "has_cisa_advisory", "has_vendor_advisory"  # Exploit information
+    ]
+    
+    num_features = [
+        "base_score", "exploitability_score", "impact_score",  # CVSS scores
+        "product_count", "reference_count",   # Scope information
+        "days_to_patch", "exploit_maturity",  # Temporal information
+        "epss_score", "epss_percentile"       # Exploit probability
+    ]
+
+    # Text features for additional signals
+    text_features = ["description"]
+    
+    # Fill missing values with appropriate defaults
+    print("Filling missing values with appropriate defaults...")
+    
+    # Handle categorical features
+    for feat in cat_features:
+        if feat not in df.columns:
+            print(f"  Adding missing feature '{feat}' with default value ''")
+            df[feat] = ""
+        else:
+            missing = df[feat].isna().sum()
+            if missing > 0:
+                print(f"  Filling {missing} NaN values in '{feat}' with ''")
+                df[feat] = df[feat].fillna("")
+    
+    # Handle numeric features
+    for feat in num_features:
+        if feat not in df.columns:
+            print(f"  Adding missing feature '{feat}' with default value 0")
+            df[feat] = 0
+        else:
+            missing = df[feat].isna().sum()
+            if missing > 0:
+                print(f"  Filling {missing} NaN values in '{feat}' with 0")
+                df[feat] = df[feat].fillna(0)
+    
+    # Handle description text feature
+    if "description" in df.columns:
+        missing = df["description"].isna().sum()
+        if missing > 0:
+            print(f"  Filling {missing} NaN values in 'description' with ''")
+            df["description"] = df["description"].fillna("")
+    
+    # Map CWE to vulnerability types
+    print("Mapping CWE to vulnerability types...")
+    df['original_type'] = df['vuln_type'] if 'vuln_type' in df.columns else 'Unknown'
+    df['vuln_type'] = df['cwe'].apply(map_cwe_to_vuln_type)
+    
+    # Integrate validation data if available
+    if validation_df is not None:
+        print("Integrating manually validated vulnerability types...")
+        # Create a mapping from CVE to validated type
+        valid_types = validation_df[['CVE', 'validated_type']].dropna(subset=['validated_type'])
+        cve_to_type = dict(zip(valid_types['CVE'], valid_types['validated_type']))
+        
+        # Count how many records will be updated
+        update_count = df['CVE'].isin(cve_to_type.keys()).sum() if 'CVE' in df.columns else 0
+        print(f"Updating {update_count} records with validated vulnerability types")
+        
+        # Update vulnerability types using validation data
+        if 'CVE' in df.columns:
+            # Map validated types to main dataset
+            df['validated_type'] = df['CVE'].map(lambda x: cve_to_type.get(x, None))
+            
+            # Replace predicted types with validated types where available
+            mask = df['validated_type'].notnull()
+            df.loc[mask, 'vuln_type'] = df.loc[mask, 'validated_type']
+            print(f"Applied {mask.sum()} validated vulnerability types to the dataset")
+    
+    # Create severity as a feature (based on CVSS)
+    df["base_score"] = df["base_score"].fillna(0)
+    df["severity"] = pd.cut(df["base_score"], 
+                           bins=[0, 3.9, 6.9, 8.9, 10.0],
+                           labels=["Low", "Medium", "High", "Critical"])
+    
+    # Extract text features
+    if all(feat in df.columns for feat in text_features):
+        print("Extracting text features from descriptions...")
+        df = extract_text_features(df)
+    
+    # Reduce cardinality of high-dimensional categorical features
+    print("Limiting cardinality of high-dimensional categorical features...")
+    
+    # Vendor and product grouping with improved handling
+    df['vendor'] = df['vendor'].fillna('Unknown')
+    df['product'] = df['product'].fillna('Unknown')
+    
+    # Top vendors cover ~80% of data
+    top_vendors = df['vendor'].value_counts().head(50).index
+    df.loc[~df['vendor'].isin(top_vendors), 'vendor'] = 'Other_Vendor'
+    
+    # Top products cover ~70% of data
+    top_products = df['product'].value_counts().head(100).index
+    df.loc[~df['product'].isin(top_products), 'product'] = 'Other_Product'
+
+    # Better CWE handling - group similar CWEs by prefix
+    if 'cwe' in df.columns:
+        df['cwe_group'] = df['cwe'].fillna('Unknown').apply(lambda x: extract_cwe_group(x) if isinstance(x, str) else 'Unknown')
+        cat_features.append('cwe_group')
+    
+    # Filter out very rare vulnerability classes
+    class_counts = df['vuln_type'].value_counts()
+    min_samples_per_class = 10  # Increased from 6 for better representation
+    rare_classes = class_counts[class_counts < min_samples_per_class].index
+    print(f"Grouping {len(rare_classes)} rare vulnerability types with fewer than {min_samples_per_class} samples into 'Other'")
+    
+    # Instead of removing, merge them into "Other" for better coverage
+    df.loc[df['vuln_type'].isin(rare_classes), 'vuln_type'] = 'Other'
+    
+    # Update feature lists to remove any that still don't exist
+    cat_features = [f for f in cat_features if f in df.columns]
+    num_features = [f for f in num_features if f in df.columns]
+    
+    # Prepare final features and targets
+    X = df[cat_features + num_features]
+    y_type = df["vuln_type"]
+    y_severity = df["severity"]
+    
+    # Final check for NaN values before training
+    nan_cols = X.columns[X.isna().any()].tolist()
+    if nan_cols:
+        print("WARNING: NaN values still detected after preprocessing in:")
+        for col in nan_cols:
+            nan_count = X[col].isna().sum()
+            print(f"  {col}: {nan_count} NaN values ({nan_count/len(X)*100:.2f}%)")
+        
+        # Additional cleanup for any remaining NaNs
+        print("Applying final NaN cleanup...")
+        for col in nan_cols:
+            if col in cat_features:
+                X[col] = X[col].fillna("")
+            else:
+                X[col] = X[col].fillna(0)
+    else:
+        print("No NaN values detected after preprocessing. Data is ready for training.")
+    
+    # Print dataset statistics
+    print(f"Dataset statistics:")
+    print(f"  Total records: {len(df)}")
+    print(f"  Unique vulnerability types: {df['vuln_type'].nunique()}")
+    print(f"  Distribution of vulnerability types:")
+    for vuln_type, count in df['vuln_type'].value_counts().sort_values(ascending=False).items():
+        print(f"    {vuln_type}: {count} ({count/len(df)*100:.1f}%)")
+    
+    # Split data with stratification
+    X_train, X_test, y_train_type, y_test_type, y_train_sev, y_test_sev = train_test_split(
+        X, y_type, y_severity, test_size=0.2, random_state=42, stratify=y_type)
+    
+    return X_train, X_test, y_train_type, y_test_type, y_train_sev, y_test_sev, df, cat_features, num_features
+
+def build_type_classifier(X_train, y_train, cat_features, num_features):
+    """Build and train a vulnerability type classifier with robust NaN handling."""
+    # Final verification for NaN values
+    nan_check = X_train.isna().sum().sum()
+    if nan_check > 0:
+        print(f"WARNING: {nan_check} NaN values found in training data before preprocessing.")
+        print("Applying emergency NaN handling...")
+        
+        # Apply emergency cleaning to ensure no NaN values remain
+        for col in X_train.columns:
+            if X_train[col].isna().any():
+                if col in cat_features:
+                    X_train[col] = X_train[col].fillna("")
+                else:
+                    X_train[col] = X_train[col].fillna(0)
+                    
+        # Verify fix
+        if X_train.isna().sum().sum() > 0:
+            raise ValueError("Failed to remove all NaN values from training data!")
+    
+    # Create preprocessing steps with SimpleImputer for extra safety
+    from sklearn.impute import SimpleImputer
+    
+    preprocessor = ColumnTransformer(
+        transformers=[
+            ('cat', Pipeline([
+                ('imputer', SimpleImputer(strategy='constant', fill_value='')),
+                ('encoder', OneHotEncoder(handle_unknown='ignore'))
+            ]), cat_features),
+            ('num', Pipeline([
+                ('imputer', SimpleImputer(strategy='constant', fill_value=0)),
+                ('scaler', StandardScaler())
+            ]), num_features)
+        ], remainder='passthrough')
+    
+    # Create pipeline with preprocessor, feature selection, and classifier
+    pipeline = Pipeline(steps=[
+        ('preprocessor', preprocessor),
+        ('feature_selection', SelectFromModel(RandomForestClassifier(n_estimators=50, random_state=42))),
+        ('classifier', RandomForestClassifier(random_state=42))
+    ])
+    
+    # More focused parameter grid for better performance/time tradeoff
+    param_grid = {
+        'classifier__n_estimators': [100],
+        'classifier__max_depth': [20, None],
+        'classifier__min_samples_split': [5, 10],
+        'classifier__class_weight': ['balanced'],
+        'feature_selection__threshold': ['mean', '1.25*mean'] 
+    }
+    
+    # Use stratified k-fold for more reliable validation
+    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    
+    # Perform grid search with cross-validation
+    print("Performing hyperparameter tuning...")
+    grid_search = GridSearchCV(
+        pipeline, 
+        param_grid, 
+        cv=cv, 
+        scoring='f1_weighted',
+        n_jobs=-1,
+        verbose=2,
+        error_score='raise'
+    )
+    
+    # Set a maximum runtime
+    start_time = time()
+    max_time = 1800  # 30 minutes
+    
+    # Fit model with a timeout and proper error handling
+    try:
+        print("Starting model training (max 30 minutes)...")
+        grid_search.fit(X_train, y_train)
+        
+        print(f"Best parameters: {grid_search.best_params_}")
+        print(f"Best cross-validation score: {grid_search.best_score_:.4f}")
+        
+        # Return the best model
+        return grid_search.best_estimator_
+    except Exception as e:
+        print(f"Error during model training: {e}")
+        if time() - start_time > max_time:
+            print("Training exceeded time limit. Using default model instead.")
+        
+        # If grid search fails, return a more robust default model with explicit NaN handling
+        print("Falling back to a simpler model with explicit NaN handling...")
+        
+        # Create a simpler pipeline without grid search or feature selection
+        from sklearn.ensemble import HistGradientBoostingClassifier
+        
+        # HistGradientBoostingClassifier can handle NaN values natively
+        simple_pipeline = Pipeline(steps=[
+            ('preprocessor', preprocessor),
+            ('classifier', HistGradientBoostingClassifier(
+                max_iter=100,
+                l2_regularization=1.0,
+                max_depth=20,
+                learning_rate=0.1,
+                random_state=42
+            ))
+        ])
+        
+        try:
+            print("Training fallback model...")
+            simple_pipeline.fit(X_train, y_train)
+            print("Fallback model trained successfully!")
+            return simple_pipeline
+        except Exception as fallback_error:
+            print(f"Error in fallback model training: {fallback_error}")
+            
+            # Last resort - use a completely basic model
+            print("Using last resort RandomForest with minimal preprocessing...")
+            
+            # Simple one-hot encoding for categorical features
+            from sklearn.preprocessing import OneHotEncoder
+            
+            # Process categorical features
+            cat_data = X_train[cat_features].fillna('MISSING')
+            cat_encoder = OneHotEncoder(handle_unknown='ignore', sparse_output=False)
+            encoded_cats = cat_encoder.fit_transform(cat_data)
+            
+            # Process numerical features
+            num_data = X_train[num_features].fillna(0).values
+            
+            # Combine features
+            import numpy as np
+            X_combined = np.hstack([encoded_cats, num_data])
+            
+            # Basic model
+            final_model = RandomForestClassifier(
+                n_estimators=100, 
+                max_depth=None,
+                min_samples_split=5,
+                class_weight='balanced',
+                random_state=42
+            )
+            
+            final_model.fit(X_combined, y_train)
+            
+            # Create a wrapper to handle the preprocessing for prediction
+            class ModelWrapper:
+                def __init__(self, model, cat_encoder, cat_features, num_features):
+                    self.model = model
+                    self.cat_encoder = cat_encoder
+                    self.cat_features = cat_features
+                    self.num_features = num_features
+                
+                def predict(self, X):
+                    cat_data = X[self.cat_features].fillna('MISSING')
+                    encoded_cats = self.cat_encoder.transform(cat_data)
+                    num_data = X[self.num_features].fillna(0).values
+                    X_combined = np.hstack([encoded_cats, num_data])
+                    return self.model.predict(X_combined)
+                
+                def predict_proba(self, X):
+                    cat_data = X[self.cat_features].fillna('MISSING')
+                    encoded_cats = self.cat_encoder.transform(cat_data)
+                    num_data = X[self.num_features].fillna(0).values
+                    X_combined = np.hstack([encoded_cats, num_data])
+                    return self.model.predict_proba(X_combined)
+            
+            return ModelWrapper(final_model, cat_encoder, cat_features, num_features)
+
+
+def extract_cwe_group(cwe_str):
+    """Extract CWE group for better feature grouping."""
+    if not isinstance(cwe_str, str) or not cwe_str.strip():
+        return 'Unknown'
+    
+    # Extract CWE number
+    match = re.search(r'CWE-(\d+)', cwe_str)
+    if not match:
+        try:
+            # Try to extract just the number
+            if cwe_str.isdigit():
+                cwe_num = int(cwe_str)
+            else:
+                return 'Other'
+        except:
+            return 'Other'
+    else:
+        cwe_num = int(match.group(1))
+    
+    # Group by hundreds (e.g., CWE-79 -> CWE-0xx)
+    return f"CWE-{cwe_num // 100}xx"
+
+def extract_text_features(df):
+    """Extract features from text descriptions."""
+    # Add basic text features
+    if 'description' in df.columns:
+        # Length of description might correlate with complexity
+        df['description_length'] = df['description'].fillna('').apply(len)
+        
+        # Count of technical terms might indicate vulnerability type
+        tech_terms = ['buffer', 'overflow', 'injection', 'XSS', 'SQL', 'authentication',
+                     'authorization', 'privilege', 'memory', 'leak', 'disclosure']
+        
+        for term in tech_terms:
+            df[f'has_{term.lower()}'] = df['description'].fillna('').str.lower().str.contains(term.lower()).astype(int)
+    
+    return df
+
+def extract_mitigation_info(references):
+    """Extract potential mitigation information from references."""
+    if not isinstance(references, str):
+        return {}
+    
+    mitigation_info = {}
+    # Keywords that indicate mitigation approaches
+    if 'patch' in references.lower():
+        mitigation_info['patch_available'] = True
+    if 'workaround' in references.lower() or 'mitigation' in references.lower():
+        mitigation_info['workaround_available'] = True
+    if 'cve' in references.lower() or 'advisory' in references.lower():
+        mitigation_info['advisory_available'] = True
+    
+    return mitigation_info
+
+def map_cwe_to_vuln_type(cwe):
+    """
+    Map CWE ID to a meaningful vulnerability type with improved accuracy.
+    Now leverages both CWE mapping and validation data patterns.
+    """
+    if not cwe or not isinstance(cwe, str):
+        return 'Unknown'
+    
+    # Direct mapping from CWE to vulnerability type
+    vuln_type = get_vulnerability_type(cwe)
+    
+    # If that doesn't yield a specific type, try the database for more context
+    if vuln_type == 'Other':
+        try:
+            db = VulnerabilityDatabase()
+            conn = db.connect()
+            cursor = conn.cursor()
+            cursor.execute("SELECT name, description FROM weaknesses WHERE cwe_id=?", (cwe,))
+            result = cursor.fetchone()
+            conn.close()
+            
+            if result and result[0]:
+                name = result[0].lower()
+                description = result[1].lower() if result[1] else ""
+                
+                # Enhanced categorization using both name and description
+                text_to_analyze = name + " " + description
+                
+                # Improved mapping logic with more specific patterns
+                type_patterns = {
+                    'Injection': ['inject', 'sql', 'command', 'ldap', 'xpath', 'nosql'],
+                    'Cross-site Scripting (XSS)': ['xss', 'cross site', 'script', 'client side'],
+                    'Buffer Overflow': ['buffer', 'overflow', 'out of bounds', 'stack', 'heap'],
+                    'Information Disclosure': ['info', 'disclos', 'leak', 'expose', 'sensitive'],
+                    'Denial of Service (DoS)': ['dos', 'denial', 'crash', 'resource', 'exhaust'],
+                    'Authentication Issues': ['authent', 'login', 'password', 'credential'],
+                    'Authorization Issues': ['authoriz', 'access control', 'permission'],
+                    'Cryptographic Issues': ['crypto', 'cipher', 'encrypt', 'random', 'hash'],
+                    'Path Traversal': ['path', 'travers', 'directory', 'file include'],
+                    'Race Condition': ['race', 'toctou', 'synchron', 'concurr'],
+                    'Memory Corruption': ['memory', 'corrupt', 'use after free', 'double free'],
+                    'Input Validation': ['input', 'valid', 'sanitiz', 'filter'],
+                    'CSRF': ['csrf', 'cross site request', 'forgery'],
+                    'Security Bypass': ['bypass', 'circumvent', 'disable'],
+                    'Privilege Escalation': ['privilege', 'escal', 'elevation']
+                }
+                
+                # Check each pattern set
+                for type_name, patterns in type_patterns.items():
+                    if any(pattern in text_to_analyze for pattern in patterns):
+                        return type_name
+        except Exception as e:
+            print(f"Error querying CWE database: {e}")
+    
+    return vuln_type
+
+def get_vulnerability_type(cwe):
+    """
+    Enhanced function to map CWE to vulnerability type,
+    incorporating manual validation patterns.
+    """
+    # This would normally come from the data_processing module
+    # For demonstration, included directly here
+    
+    # Common CWEs mapped to vulnerability types
+    cwe_mapping = {
+    # Injection vulnerabilities
+    'CWE-89': 'SQL Injection',
+    'CWE-564': 'SQL Injection',
+    'CWE-79': 'Cross-site Scripting (XSS)',
+    'CWE-80': 'Cross-site Scripting (XSS)',
+    'CWE-78': 'Command Injection',
+    'CWE-77': 'Command Injection',
+    'CWE-91': 'XML Injection',
+    'CWE-917': 'Expression Language Injection',
+    
+    # Authentication/Access
+    'CWE-287': 'Authentication Issues',
+    'CWE-306': 'Authentication Issues',
+    'CWE-522': 'Weak Credentials',
+    'CWE-521': 'Weak Credentials',
+    'CWE-798': 'Hardcoded Credentials',
+    'CWE-259': 'Hardcoded Credentials',
+    'CWE-284': 'Access Control Issues',
+    'CWE-285': 'Access Control Issues',
+    'CWE-639': 'Access Control Issues',
+
+    # Information disclosure
+    'CWE-200': 'Information Disclosure',
+    'CWE-209': 'Information Disclosure',
+    'CWE-532': 'Information Disclosure',
+    
+    # File-related vulnerabilities
+    'CWE-22': 'Path Traversal',
+    'CWE-23': 'Path Traversal',
+    'CWE-434': 'Unrestricted File Upload',
+    'CWE-73': 'Path Traversal',
+    'CWE-59': 'Link Following',
+    
+    # Memory safety
+    'CWE-119': 'Buffer Overflow',
+    'CWE-120': 'Buffer Overflow',
+    'CWE-121': 'Stack-based Buffer Overflow',
+    'CWE-122': 'Heap-based Buffer Overflow',
+    'CWE-125': 'Out-of-bounds Read',
+    'CWE-787': 'Out-of-bounds Write',
+    'CWE-416': 'Use After Free',
+    'CWE-415': 'Double Free',
+    'CWE-476': 'NULL Pointer Dereference',
+    'CWE-401': 'Memory Leak',
+    'CWE-400': 'Resource Exhaustion',
+    'CWE-674': 'Resource Exhaustion',
+    
+    # Cryptographic
+    'CWE-295': 'Certificate Validation',
+    'CWE-327': 'Broken/Risky Crypto',
+    'CWE-328': 'Broken/Risky Crypto',
+    'CWE-326': 'Inadequate Encryption Strength',
+    'CWE-759': 'Weak Salt',
+    'CWE-321': 'Broken/Risky Crypto',
+    
+    # Web-specific
+    'CWE-352': 'Cross-Site Request Forgery (CSRF)',
+    'CWE-601': 'Open Redirect',
+    'CWE-918': 'SSRF',
+    'CWE-611': 'XXE',
+    'CWE-384': 'Session Fixation',
+    
+    # Other
+    'CWE-20': 'Improper Input Validation',
+    'CWE-94': 'Code Injection',
+    'CWE-502': 'Deserialization of Untrusted Data',
+    'CWE-269': 'Privilege Escalation',
+    'CWE-863': 'Access Control Issues',
+    'CWE-770': 'Resource Allocation',
+    'CWE-362': 'Race Condition',
+    'CWE-319': 'Cleartext Transmission',
+    'CWE-330': 'Weak Random',
+    }
+    
+    # Normalize CWE format
+    if isinstance(cwe, str):
+        if cwe.isdigit():
+            cwe_id = f"CWE-{cwe}"
+        elif cwe.lower().startswith('cwe-') and cwe[4:].isdigit():
+            cwe_id = f"CWE-{cwe[4:]}"
+        else:
+            cwe_id = cwe
+    else:
+        return "Unknown"
+    
+    # Look up the vulnerability type
+    return cwe_mapping.get(cwe_id, "Other")
+
+def evaluate_model(model, X_test, y_test, output_dir="models"):
+    """Evaluate model and generate detailed performance metrics."""
+    y_pred = model.predict(X_test)
+    
+    # Calculate and print metrics
+    print("\nClassification Report:")
+    print(classification_report(y_test, y_pred))
+    
+    # Generate confusion matrix
+    plt.figure(figsize=(14, 12))
+    cm = confusion_matrix(y_test, y_pred, normalize='true')
+    
+    # Plot confusion matrix
+    sns.heatmap(cm, annot=True, fmt='.2f', cmap='Blues',
+                xticklabels=np.unique(y_test),
+                yticklabels=np.unique(y_test))
+    plt.xlabel('Predicted')
+    plt.ylabel('True')
+    plt.title('Normalized Confusion Matrix')
+    plt.tight_layout()
+    
+    # Save the confusion matrix
+    os.makedirs(output_dir, exist_ok=True)
+    plt.savefig(f"{output_dir}/confusion_matrix.png")
+    plt.close()
+    
+    # If using a random forest, analyze feature importance
+    feature_importance = None
+    if hasattr(model, 'steps') and 'classifier' in dict(model.steps):
+        classifier = model.named_steps['classifier']
+        if hasattr(classifier, 'feature_importances_'):
+            # Get feature names if possible
+            feature_names = []
+            try:
+                # Get transformed feature names from preprocessor
+                preprocessor = model.named_steps['preprocessor']
+                feature_names = preprocessor.get_feature_names_out()
+            except:
+                # Fall back to generic feature names
+                feature_names = [f"feature_{i}" for i in range(len(classifier.feature_importances_))]
+            
+            # Get feature importance
+            feature_importance = pd.DataFrame({
+                'Feature': feature_names,
+                'Importance': classifier.feature_importances_
+            }).sort_values('Importance', ascending=False)
+            
+            # Plot top 20 feature importances
+            plt.figure(figsize=(12, 10))
+            sns.barplot(x='Importance', y='Feature', data=feature_importance.head(20))
+            plt.title('Top 20 Feature Importances')
+            plt.tight_layout()
+            plt.savefig(f"{output_dir}/feature_importance.png")
+            plt.close()
+            
+            # Save feature importance to CSV
+            feature_importance.to_csv(f"{output_dir}/feature_importance.csv", index=False)
+    
+    return y_pred, feature_importance
+
+def main(skip_training=False, validation_file="models/validation_sample.csv"):
+    """
+    Main function to prepare data and train or load a vulnerability type classifier.
+    
+    Args:
+        skip_training (bool): If True, attempts to load a pre-trained model instead of training
+                              a new one. If loading fails, falls back to training. Defaults to False.
+        validation_file (str): Path to validation data file
+    
+    Returns:
+        tuple: The trained model and processed dataset
+    """
+    print(f"Running vulnerability classifier with skip_training={skip_training}")
+    
+    # Load and prepare data, now including validation data
+    X_train, X_test, y_train_type, y_test_type, y_train_sev, y_test_sev, df, cat_features, num_features = prepare_data(
+        validation_file=validation_file
+    )
+    
+    # Handle model (either load existing or train new)
+    model_path = "models/vuln_type_classifier.joblib"
+    model = None
+    
+    if skip_training:
+        # Try to load existing model
+        print("Attempting to load pre-trained model...")
+        try:
+            if os.path.exists(model_path):
+                model = joblib.load(model_path)
+                print(f"Successfully loaded model from {model_path}")
+            else:
+                print(f"No model found at {model_path}")
+                model = None
+        except Exception as e:
+            print(f"Error loading model: {e}")
+            model = None
+    
+    # Train new model if needed
+    if model is None:
+        print("Training new vulnerability type classifier...")
+        model = build_type_classifier(X_train, y_train_type, cat_features, num_features)
+        
+        # Save model
+        os.makedirs(os.path.dirname(model_path), exist_ok=True)
+        joblib.dump(model, model_path)
+        print(f"Type classifier saved to {model_path}")
+    
+    # Evaluate model
+    print("Evaluating vulnerability type classifier...")
+    y_pred_type, feature_importance = evaluate_model(model, X_test, y_test_type)
+    
+    # Create summary of model performance
+    model_summary = {
+        'Accuracy': (y_pred_type == y_test_type).mean(),
+        'F1 Score': f1_score(y_test_type, y_pred_type, average='weighted'),
+        'Total Samples': len(df),
+        'Training Samples': len(X_train),
+        'Test Samples': len(X_test),
+        'Classes': np.unique(y_train_type).tolist(),
+        'Class Count': len(np.unique(y_train_type)),
+        'Features Used': cat_features + num_features
+    }
+    
+    # Save model summary
+    summary_path = "models/model_summary.json"
+    import json
+    with open(summary_path, 'w') as f:
+        json.dump(model_summary, f, indent=2)
+    
+    # Save the complete dataset with classifications for further analysis
+    output_path = "analysis/classified_vulnerabilities_with_details.csv"
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    df.to_csv(output_path, index=False)
+    print(f"Complete classified dataset with details saved to {output_path}")
+    
+    print("\nVulnerability classification complete.")
+    print(f"Model performance summary: Accuracy={model_summary['Accuracy']:.4f}, F1={model_summary['F1 Score']:.4f}")
+    print("For detailed analysis, run: python analysis/advanced_vulnerability_analysis.py")
+    
+    return model, df
+
+
+if __name__ == "__main__":
+    # Added explicit validation file parameter
+    if "--validation-file" in sys.argv:
+        validation_idx = sys.argv.index("--validation-file")
+        if validation_idx + 1 < len(sys.argv):
+            validation_file = sys.argv[validation_idx + 1]
+            # Remove these arguments so they don't interfere with skip_training check
+            sys.argv.pop(validation_idx)
+            sys.argv.pop(validation_idx)
+        else:
+            validation_file = "models/validation_sample.csv"
+    else:
+        validation_file = "models/validation_sample.csv"
+    
+    # Handle skip-training argument
+    if len(sys.argv) > 1 and "--skip-training" in sys.argv:
+        main(skip_training=True, validation_file=validation_file)
+    else:
+        main(skip_training=False, validation_file=validation_file)

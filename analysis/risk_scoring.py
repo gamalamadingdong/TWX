@@ -161,7 +161,7 @@ def analyze_risk_scores():
         # Map to vulnerability type
         vuln_type = "Unknown"
         if 'cwe' in vuln_data and vuln_data['cwe']:
-            from models.vuln_classifier import map_cwe_to_vuln_type
+            from models.enhanced_classifier import map_cwe_to_vuln_type
             vuln_type = map_cwe_to_vuln_type(vuln_data['cwe'][0])
         
         # Store results
