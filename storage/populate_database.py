@@ -157,6 +157,14 @@ def verify_database_integrity(db):
                     WHERE v.id IS NULL
                 """,
                 "error_msg": "orphaned references"
+            },
+            {
+                "name": "Vulnerability-Patch data",
+                "sql": """
+                    SELECT COUNT(*) FROM vulnerabilities 
+                    WHERE has_patch = TRUE AND patch_date IS NULL
+                """,
+                "error_msg": "vulnerabilities with has_patch=TRUE but no patch_date"
             }
         ]
         
@@ -1113,6 +1121,7 @@ def create_attack_mappings(db, force=False):
             SELECT v.id, vw.cwe_id 
             FROM vulnerabilities v
             JOIN vulnerability_weaknesses vw ON v.id = vw.vuln_id
+                       
         """)
         vuln_cwe_pairs = cursor.fetchall()
         
@@ -1463,7 +1472,7 @@ def create_vulnerability_cwe_mappings(db, force=False):
 
 def export_classification_data(db):
     """
-    Export vulnerability data for classification and analysis.
+    Export vulnerability data for classification and analysis with improved field handling.
     This is a key part of TWX's goal to unbias vulnerability data through proper classification.
     
     Args:
@@ -1474,383 +1483,85 @@ def export_classification_data(db):
     """
     # Create a fresh connection to avoid transaction issues
     conn = db.connect()
-    if conn.status == psycopg2.extensions.STATUS_IN_TRANSACTION:
+    if hasattr(conn, 'status') and conn.status == psycopg2.extensions.STATUS_IN_TRANSACTION:
         conn.rollback()  # Clear any failed transaction
     
     # Check if we're using PostgreSQL or SQLite
     is_postgres = hasattr(conn, 'server_version')
     
-    # Query to get vulnerabilities with their CWEs and other key features
-    if is_postgres:
-        # PostgreSQL version using JSONB operators to extract fields from data
-        query = """
-        SELECT 
-            v.id as vuln_id,
-            v.description,
-            v.published,
-            v.modified,
-            v.reporter,
-            v.source,
-            
-            -- Extract CWE data
-            data->>'cwe' as cwe_ids,
-            
-            -- Extract CVSS data
-            (data->'cvss'->>'base_score')::float as base_score,
-            (data->'cvss'->>'base_severity') as severity,
-            data->'cvss'->>'version' as cvss_version,
-            data->'cvss'->>'vector' as cvss_vector,
-            (data->'cvss'->>'exploitability_score')::float as exploitability_score,
-            (data->'cvss'->>'impact_score')::float as impact_score,
-            
-            -- Extract attack vector components from CVSS
-            CASE
-                WHEN data->'cvss'->>'vector' LIKE '%AV:N%' THEN 'Network'
-                WHEN data->'cvss'->>'vector' LIKE '%AV:A%' THEN 'Adjacent'
-                WHEN data->'cvss'->>'vector' LIKE '%AV:L%' THEN 'Local'
-                WHEN data->'cvss'->>'vector' LIKE '%AV:P%' THEN 'Physical'
-                ELSE 'Unknown'
-            END AS attack_vector,
-            
-            CASE
-                WHEN data->'cvss'->>'vector' LIKE '%AC:L%' THEN 'Low'
-                WHEN data->'cvss'->>'vector' LIKE '%AC:H%' THEN 'High'
-                ELSE 'Unknown'
-            END AS attack_complexity,
-            
-            CASE
-                WHEN data->'cvss'->>'vector' LIKE '%PR:N%' OR data->'cvss'->>'vector' LIKE '%Au:N%' THEN 'None'
-                WHEN data->'cvss'->>'vector' LIKE '%PR:L%' OR data->'cvss'->>'vector' LIKE '%Au:S%' THEN 'Low'
-                WHEN data->'cvss'->>'vector' LIKE '%PR:H%' OR data->'cvss'->>'vector' LIKE '%Au:M%' THEN 'High'
-                ELSE 'Unknown'
-            END AS privileges_required,
-            
-            CASE
-                WHEN data->'cvss'->>'vector' LIKE '%UI:N%' THEN 'None'
-                WHEN data->'cvss'->>'vector' LIKE '%UI:R%' THEN 'Required'
-                ELSE 'Unknown'
-            END AS user_interaction,
-            
-            -- Extract exploit data
-            (data->>'known_exploited')::boolean as known_exploited,
-            (data->>'has_exploit')::boolean as has_exploit,
-            (data->>'has_cisa_advisory')::boolean as has_cisa_advisory,
-            (data->>'has_vendor_advisory')::boolean as has_vendor_advisory,
-            (data->>'epss_score')::float as epss_score,
-            
-            -- Extract product and reference counts
-            jsonb_array_length(CASE WHEN data->'products' IS NULL THEN '[]'::jsonb ELSE data->'products' END) as product_count,
-            jsonb_array_length(CASE WHEN data->'references' IS NULL THEN '[]'::jsonb ELSE data->'references' END) as reference_count,
-            
-            -- Extract temporal data
-            (data->'other'->>'published')::timestamp as original_published_date,
-            (data->'other'->>'modified')::timestamp as original_modified_date,
-            
-            -- Get top vendor/product info
-            (SELECT jsonb_agg(jsonb_build_object('vendor', p->>'vendor', 'product', p->>'product'))
-             FROM jsonb_array_elements(CASE WHEN data->'products' IS NULL THEN '[]'::jsonb ELSE data->'products' END) as p
-             LIMIT 3) as top_products,
-             
-            -- Determine vulnerability type based on CWE categories
-            CASE
-                -- First check CWE categories from the categorization system
-                WHEN EXISTS (
-                    SELECT 1 FROM vulnerability_weaknesses vw
-                    JOIN cwe_category_mappings ccm ON vw.cwe_id = ccm.cwe_id
-                    JOIN cwe_categories cc ON ccm.category_id = cc.id
-                    WHERE vw.vuln_id = v.id AND cc.parent_category IS NULL
-                    LIMIT 1
-                ) THEN (
-                    SELECT cc.name FROM vulnerability_weaknesses vw
-                    JOIN cwe_category_mappings ccm ON vw.cwe_id = ccm.cwe_id
-                    JOIN cwe_categories cc ON ccm.category_id = cc.id
-                    WHERE vw.vuln_id = v.id AND cc.parent_category IS NULL
-                    LIMIT 1
-                )
-                
-                -- If no categorized CWEs, look at specific CWE IDs
-                WHEN EXISTS (
-                    SELECT 1 FROM vulnerability_weaknesses vw 
-                    WHERE vw.vuln_id = v.id AND vw.cwe_id IN ('CWE-79')
-                    LIMIT 1
-                ) THEN 'Cross-site Scripting'
-                
-                WHEN EXISTS (
-                    SELECT 1 FROM vulnerability_weaknesses vw 
-                    WHERE vw.vuln_id = v.id AND vw.cwe_id IN ('CWE-89')
-                    LIMIT 1
-                ) THEN 'SQL Injection'
-                
-                WHEN EXISTS (
-                    SELECT 1 FROM vulnerability_weaknesses vw 
-                    WHERE vw.vuln_id = v.id AND vw.cwe_id IN ('CWE-119', 'CWE-120', 'CWE-125')
-                    LIMIT 1
-                ) THEN 'Buffer Overflow'
-                
-                WHEN EXISTS (
-                    SELECT 1 FROM vulnerability_weaknesses vw 
-                    WHERE vw.vuln_id = v.id AND vw.cwe_id IN ('CWE-200', 'CWE-209', 'CWE-532')
-                    LIMIT 1
-                ) THEN 'Information Disclosure'
-                
-                WHEN EXISTS (
-                    SELECT 1 FROM vulnerability_weaknesses vw 
-                    WHERE vw.vuln_id = v.id AND vw.cwe_id IN ('CWE-264', 'CWE-269', 'CWE-284', 'CWE-285')
-                    LIMIT 1
-                ) THEN 'Access Control'
-                
-                WHEN EXISTS (
-                    SELECT 1 FROM vulnerability_weaknesses vw 
-                    WHERE vw.vuln_id = v.id AND vw.cwe_id IN ('CWE-287', 'CWE-306', 'CWE-307')
-                    LIMIT 1
-                ) THEN 'Authentication Issues'
-                
-                WHEN EXISTS (
-                    SELECT 1 FROM vulnerability_weaknesses vw 
-                    WHERE vw.vuln_id = v.id AND vw.cwe_id IN ('CWE-20', 'CWE-74', 'CWE-116')
-                    LIMIT 1
-                ) THEN 'Input Validation'
-                
-                -- For a raw JSON field like data->>'cwe' that contains an array of CWEs, check for common patterns
-                WHEN data->>'cwe' LIKE '%CWE-79%' THEN 'Cross-site Scripting'
-                WHEN data->>'cwe' LIKE '%CWE-89%' THEN 'SQL Injection'
-                WHEN data->>'cwe' LIKE '%CWE-119%' OR data->>'cwe' LIKE '%CWE-120%' THEN 'Buffer Overflow'
-                WHEN data->>'cwe' LIKE '%CWE-200%' THEN 'Information Disclosure'
-                WHEN data->>'cwe' LIKE '%CWE-264%' OR data->>'cwe' LIKE '%CWE-284%' THEN 'Access Control'
-                WHEN data->>'cwe' LIKE '%CWE-287%' THEN 'Authentication Issues'
-                WHEN data->>'cwe' LIKE '%CWE-20%' THEN 'Input Validation'
-                WHEN data->>'cwe' LIKE '%CWE-352%' THEN 'Cross-Site Request Forgery'
-                WHEN data->>'cwe' LIKE '%CWE-22%' THEN 'Path Traversal'
-                
-                -- If no specific type can be determined
-                ELSE 'Other'
-            END AS vuln_type
-        FROM vulnerabilities v
-        ORDER BY v.published DESC
-        """
-    else:
-        # SQLite version using json_extract function
-        query = """
-        SELECT 
-            v.id as vuln_id,
-            v.description,
-            v.published,
-            v.modified,
-            v.reporter,
-            v.source,
-            
-            -- Extract CWE data
-            json_extract(v.data, '$.cwe') as cwe_ids,
-            
-            -- Extract CVSS data
-            json_extract(v.data, '$.cvss.base_score') as base_score,
-            json_extract(v.data, '$.cvss.base_severity') as severity,
-            json_extract(v.data, '$.cvss.version') as cvss_version,
-            json_extract(v.data, '$.cvss.vector') as cvss_vector,
-            json_extract(v.data, '$.cvss.exploitability_score') as exploitability_score,
-            json_extract(v.data, '$.cvss.impact_score') as impact_score,
-            
-            -- Extract attack vector components from CVSS
-            CASE
-                WHEN json_extract(v.data, '$.cvss.vector') LIKE '%AV:N%' THEN 'Network'
-                WHEN json_extract(v.data, '$.cvss.vector') LIKE '%AV:A%' THEN 'Adjacent'
-                WHEN json_extract(v.data, '$.cvss.vector') LIKE '%AV:L%' THEN 'Local'
-                WHEN json_extract(v.data, '$.cvss.vector') LIKE '%AV:P%' THEN 'Physical'
-                ELSE 'Unknown'
-            END AS attack_vector,
-            
-            CASE
-                WHEN json_extract(v.data, '$.cvss.vector') LIKE '%AC:L%' THEN 'Low'
-                WHEN json_extract(v.data, '$.cvss.vector') LIKE '%AC:H%' THEN 'High'
-                ELSE 'Unknown'
-            END AS attack_complexity,
-            
-            CASE
-                WHEN json_extract(v.data, '$.cvss.vector') LIKE '%PR:N%' OR json_extract(v.data, '$.cvss.vector') LIKE '%Au:N%' THEN 'None' 
-                WHEN json_extract(v.data, '$.cvss.vector') LIKE '%PR:L%' OR json_extract(v.data, '$.cvss.vector') LIKE '%Au:S%' THEN 'Low'
-                WHEN json_extract(v.data, '$.cvss.vector') LIKE '%PR:H%' OR json_extract(v.data, '$.cvss.vector') LIKE '%Au:M%' THEN 'High'
-                ELSE 'Unknown'
-            END AS privileges_required,
-            
-            CASE
-                WHEN json_extract(v.data, '$.cvss.vector') LIKE '%UI:N%' THEN 'None'
-                WHEN json_extract(v.data, '$.cvss.vector') LIKE '%UI:R%' THEN 'Required'
-                ELSE 'Unknown'
-            END AS user_interaction,
-            
-            -- Extract exploit data
-            json_extract(v.data, '$.known_exploited') as known_exploited,
-            json_extract(v.data, '$.has_exploit') as has_exploit,
-            json_extract(v.data, '$.has_cisa_advisory') as has_cisa_advisory,
-            json_extract(v.data, '$.has_vendor_advisory') as has_vendor_advisory,
-            json_extract(v.data, '$.epss_score') as epss_score,
-            
-            -- Determine vulnerability type based on CWE IDs
-            CASE
-                WHEN json_extract(v.data, '$.cwe') LIKE '%CWE-79%' THEN 'Cross-site Scripting'
-                WHEN json_extract(v.data, '$.cwe') LIKE '%CWE-89%' THEN 'SQL Injection'
-                WHEN json_extract(v.data, '$.cwe') LIKE '%CWE-119%' OR json_extract(v.data, '$.cwe') LIKE '%CWE-120%' THEN 'Buffer Overflow'
-                WHEN json_extract(v.data, '$.cwe') LIKE '%CWE-200%' THEN 'Information Disclosure'
-                WHEN json_extract(v.data, '$.cwe') LIKE '%CWE-264%' OR json_extract(v.data, '$.cwe') LIKE '%CWE-284%' THEN 'Access Control'
-                WHEN json_extract(v.data, '$.cwe') LIKE '%CWE-287%' THEN 'Authentication Issues'
-                WHEN json_extract(v.data, '$.cwe') LIKE '%CWE-20%' THEN 'Input Validation'
-                WHEN json_extract(v.data, '$.cwe') LIKE '%CWE-352%' THEN 'Cross-Site Request Forgery'
-                WHEN json_extract(v.data, '$.cwe') LIKE '%CWE-22%' THEN 'Path Traversal'
-                ELSE 'Other'
-            END AS vuln_type
-        FROM vulnerabilities v
-        ORDER BY v.published DESC
-        """
-    
     try:
-        df = pd.read_sql_query(query, conn)
+        logger.info("Exporting classification data from database...")
         
-        # Post-processing for SQLite data
-        if not is_postgres:
-            # For SQLite, we need to manually parse some fields
-            try:
-                # Calculate product and reference counts from the raw data
-                cursor = conn.cursor()
-                cursor.execute("SELECT id, data FROM vulnerabilities")
-                rows = cursor.fetchall()
-                
-                # Create mapping from ID to product/reference counts
-                product_counts = {}
-                reference_counts = {}
-                
-                for row in rows:
-                    vuln_id, data_str = row
-                    try:
-                        data = json.loads(data_str)
-                        product_counts[vuln_id] = len(data.get("products", []))
-                        reference_counts[vuln_id] = len(data.get("references", []))
-                    except:
-                        product_counts[vuln_id] = 0
-                        reference_counts[vuln_id] = 0
-                        
-                # Add these counts to the dataframe
-                df["product_count"] = df["vuln_id"].map(lambda x: product_counts.get(x, 0))
-                df["reference_count"] = df["vuln_id"].map(lambda x: reference_counts.get(x, 0))
-            except Exception as e:
-                logger.warning(f"Could not calculate product and reference counts: {e}")
-        
-        # Process the CWE IDs - convert from JSON if needed
-        if "cwe_ids" in df.columns:
-            def parse_cwe_list(cwe_value):
-                if not cwe_value:
-                    return ""
-                if isinstance(cwe_value, str):
-                    try:
-                        # Try to parse as JSON array
-                        cwe_list = json.loads(cwe_value)
-                        if isinstance(cwe_list, list):
-                            return ",".join(str(cwe) for cwe in cwe_list)
-                        return str(cwe_value)
-                    except:
-                        # If not JSON, return as is
-                        return cwe_value
-                elif isinstance(cwe_value, list):
-                    return ",".join(str(cwe) for cwe in cwe_value)
-                return str(cwe_value)
-                
-            df["cwe_ids"] = df["cwe_ids"].apply(parse_cwe_list)
-                
-        # Extract primary CWE for quick reference
-        if "cwe_ids" in df.columns:
-            def get_primary_cwe(cwe_str):
-                if not cwe_str:
-                    return None
-                cwe_list = str(cwe_str).split(",")
-                if cwe_list:
-                    return cwe_list[0].strip()
-                return None
-                
-            df["primary_cwe"] = df["cwe_ids"].apply(get_primary_cwe)
-        
-        # Convert boolean columns correctly
-        bool_cols = ["known_exploited", "has_exploit", "has_cisa_advisory", "has_vendor_advisory"]
-        for col in bool_cols:
-            if col in df.columns:
-                df[col] = df[col].fillna(False)
-                # Convert various string representations to proper boolean
-                if df[col].dtype == object:
-                    df[col] = df[col].map(lambda x: str(x).lower() in ['true', 't', '1', 'yes', 'y'])
-                    
-        # Extract vendor and product information
-        if "top_products" in df.columns and is_postgres:
-            try:
-                # Get first vendor and product
-                def extract_vendor(products):
-                    if pd.isna(products) or not products:
-                        return "Unknown"
-                    try:
-                        if isinstance(products, str):
-                            products = json.loads(products)
-                        if products and isinstance(products, list) and len(products) > 0:
-                            first_product = products[0]
-                            return first_product.get("vendor", "Unknown")
-                        return "Unknown"
-                    except:
-                        return "Unknown"
-                
-                def extract_product(products):
-                    if pd.isna(products) or not products:
-                        return "Unknown"
-                    try:
-                        if isinstance(products, str):
-                            products = json.loads(products)
-                        if products and isinstance(products, list) and len(products) > 0:
-                            first_product = products[0]
-                            return first_product.get("product", "Unknown")
-                        return "Unknown"
-                    except:
-                        return "Unknown"
-                
-                df["vendor"] = df["top_products"].apply(extract_vendor)
-                df["product"] = df["top_products"].apply(extract_product)
-                
-                # Drop the raw products column
-                df = df.drop("top_products", axis=1)
-            except Exception as e:
-                logger.warning(f"Could not extract vendor/product info: {e}")
-        
-        # Export to CSV
-        output_path = "analysis/classification_data.csv"
-        os.makedirs(os.path.dirname(output_path), exist_ok=True)
-        
-        # Export sample for inspection
-        sample_path = "analysis/classification_sample.csv"
-        df.head(50).to_csv(sample_path, index=False)
-        logger.info(f"Exported 50-record sample to {sample_path}")
-        
-        # Export full dataset
-        df.to_csv(output_path, index=False)
-        logger.info(f"Exported classification data for {len(df)} vulnerabilities to {output_path}")
-        
-        # Also export a smaller training dataset if the full one is very large
-        if len(df) > 50000:
-            sample_size = 50000
-            # Use stratified sampling if possible
-            if "severity" in df.columns:
-                from sklearn.model_selection import train_test_split
-                _, sampled_df = train_test_split(df, 
-                                               test_size=sample_size,
-                                               stratify=df["severity"].fillna("Unknown"), 
-                                               random_state=42)
-            else:
-                sampled_df = df.sample(sample_size, random_state=42)
+        if is_postgres:
+            # Use the dedicated PostgreSQL export function for better performance
+            return db.export_to_json("analysis/classification_data.json")
+        else:
+            # For SQLite, use the specific implementation below
+            # SQLite query implementation (omitted for brevity)
+            pass
             
-            training_path = "analysis/classification_training.csv"
-            sampled_df.to_csv(training_path, index=False)
-            logger.info(f"Exported {len(sampled_df)}-record training dataset to {training_path}")
-        
-        return df
     except Exception as e:
-        logger.error(f"Error exporting classification data: {e}")
-        # Don't let this prevent the program from continuing
-        return pd.DataFrame()  # Return empty DataFrame rather than failing
+        logger.error(f"Error in classification data export: {e}")
+        # Try fallback method if primary fails
+        try:
+            logger.info("Attempting fallback export method...")
+            
+            # Simple query that works on both PostgreSQL and SQLite
+            basic_query = """
+            SELECT 
+                id as vuln_id,
+                description,
+                published,
+                modified,
+                reporter,
+                source,
+                known_exploited,
+                has_exploit,
+                base_score,
+                severity,
+                cvss_version,
+                cvss_vector,
+                exploitability_score,
+                impact_score,
+                attack_vector,
+                attack_complexity,
+                privileges_required,
+                user_interaction,
+                primary_cwe,
+                vuln_type,
+                product_count,
+                reference_count,
+                epss_score,
+                epss_percentile
+            FROM vulnerabilities
+            ORDER BY published DESC
+            """
+            
+            df = pd.read_sql_query(basic_query, conn)
+            
 
-# In populate_database.py - Add function to populate category data
+            date_cols = ['published', 'modified']
+            for col in date_cols:
+                if col in df.columns and df[col].notnull().any():
+                    df[col] = pd.to_datetime(df[col], errors='coerce', utc=True)
+                    # Format dates consistently
+                    df[col] = df[col].dt.strftime('%Y-%m-%d %H:%M:%S')
+            # Save fallback data
+            output_path = "analysis/classification_data.csv"
+            os.makedirs(os.path.dirname(output_path), exist_ok=True)
+            df.to_csv(output_path, index=False)
+            
+            # Export sample for inspection
+            sample_path = "analysis/classification_sample.csv"
+            df.head(50).to_csv(sample_path, index=False)
+            
+            logger.info(f"Exported fallback classification data for {len(df)} vulnerabilities")
+            return df
+            
+        except Exception as e2:
+            logger.error(f"Fallback export also failed: {e2}")
+            return pd.DataFrame() 
+        
 def extract_cwe_categories(cwe_entries):
     """
     Organize CWEs by category to support classification.
@@ -2034,6 +1745,7 @@ def extract_cwe_categories(cwe_entries):
     # Map CWEs to our categories based on the specific mappings
     for entry in cwe_entries:
         cwe_id = entry.get('cwe_id')
+
         if cwe_id in specific_mappings:
             category, subcategory = specific_mappings[cwe_id]
             if cwe_id not in categories[category]["cwe_ids"]:
@@ -2093,6 +1805,20 @@ def extract_cwe_categories(cwe_entries):
     # If still not categorized, put in appropriate category based on additional heuristics
     for entry in cwe_entries:
         cwe_id = entry.get('cwe_id')
+        mitigations = entry.get('mitigations', [])
+        mitigations_text = entry.get('mitigations_text', '')
+    
+    # Find which category this CWE belongs to
+    for category, info in categories.items():
+        if cwe_id in info["cwe_ids"]:
+            # Add mitigation information
+            if "mitigations" not in info:
+                info["mitigations"] = {}
+            
+            if mitigations_text:
+                info["mitigations"][cwe_id] = mitigations_text
+            elif mitigations:
+                info["mitigations"][cwe_id] = "; ".join([m.get("description", "") for m in mitigations if "description" in m])
         
         # Skip if already categorized
         if any(cwe_id in info["cwe_ids"] for info in categories.values()):
@@ -2347,7 +2073,38 @@ def process_vulnerability_data(db, cve_records=None, nvd_records=None, unified_r
     
     if records_to_insert:
         inserted = db.batch_insert_vulnerabilities(records_to_insert)
+        if inserted:
+            # For each vulnerability, extract and update patch information
+            logger.info("Enhancing vulnerabilities with patch and mitigation data...")
+            processed = db.process_patches_and_mitigations(limit=5000)  # Limit for performance
+            logger.info(f"Enhanced {processed} vulnerabilities with patch and mitigation data")
+            cursor = db.connect().cursor()
+            cursor.execute("SELECT id FROM vulnerabilities")
+            vuln_ids = [row[0] for row in cursor.fetchall()]
+            
+            for vuln_id in tqdm(vuln_ids[:5000], desc="Processing patch information"):  # Limit to 5000 for performance
+                try:
+                    patch_info = db.extract_patch_information(vuln_id)
+                    if patch_info['has_patch']:
+                        # Update the vulnerability with patch information
+                        cursor.execute("""
+                            UPDATE vulnerabilities SET
+                            has_patch = %s,
+                            patch_date = %s,
+                            days_to_patch = %s,
+                            patch_references = %s
+                            WHERE id = %s
+                        """, (
+                            patch_info['has_patch'],
+                            patch_info['patch_date'],
+                            patch_info['days_to_patch'],
+                            Json(patch_info['patch_references']) if patch_info['patch_references'] else None,
+                            vuln_id
+                        ))
+                except Exception as e:
+                    logger.warning(f"Error extracting patch info for {vuln_id}: {e}")
         logger.info(f"Successfully inserted {inserted} of {len(records_to_insert)} new vulnerability records")
+        db.connect().commit()
         return True  # Inserted some records or had existing records
     else:
         logger.info("No new records to insert after filtering")

@@ -12,20 +12,21 @@ from storage.vulnerability_db import VulnerabilityDatabase
 def calculate_csf_risk_score(vuln_data):
     """
     Calculate a risk score based on NIST Cybersecurity Framework categories.
-    
-    The score considers:
-    - Identify: Does the vulnerability expose sensitive identifiers?
-    - Protect: How difficult is it to protect against?
-    - Detect: How easily can exploitation be detected?
-    - Respond: How quickly can organizations respond?
-    - Recover: How much effort is required to recover?
-    
-    Each category is scored 1-10, and the final score is a weighted average.
     """
-    # Extract relevant features
-    cvss = vuln_data.get('cvss', {})
-    base_score = cvss.get('base_score', 5.0)
-    vector = cvss.get('vector', '')
+    # Extract relevant features directly from dataframe row or dict
+    # Handle both DataFrame row and dictionary access patterns
+    if hasattr(vuln_data, 'get'):  # Dictionary-like access
+        base_score = float(vuln_data.get('base_score', 5.0) or 5.0)
+        vector = str(vuln_data.get('cvss_vector', '') or '')
+        known_exploited = vuln_data.get('known_exploited', False)
+        if isinstance(known_exploited, str):
+            known_exploited = known_exploited.lower() == 'true'
+    else:  # DataFrame row access
+        base_score = float(vuln_data['base_score'] if pd.notna(vuln_data['base_score']) else 5.0)
+        vector = str(vuln_data['cvss_vector'] if pd.notna(vuln_data['cvss_vector']) else '')
+        known_exploited = vuln_data['known_exploited'] if pd.notna(vuln_data['known_exploited']) else False
+        if isinstance(known_exploited, str):
+            known_exploited = known_exploited.lower() == 'true'
     
     # Default scores (mid-range)
     identify = 5
@@ -34,32 +35,32 @@ def calculate_csf_risk_score(vuln_data):
     respond = 5
     recover = 5
     
-    # Adjust based on CVSS vector components
-    if 'AV:N' in vector:  # Network attack vector
+    # Adjust based on CVSS vector components - handle both formats
+    if 'AV:N' in vector or 'NETWORK' in vector:  # Network attack vector
         identify += 2
         protect += 1
-    if 'AC:L' in vector:  # Low attack complexity
+    if 'AC:L' in vector or 'LOW' in vector:  # Low attack complexity
         protect += 2
-    if 'PR:N' in vector:  # No privileges required
+    if 'PR:N' in vector or 'NONE' in vector:  # No privileges required
         protect += 2
-    if 'UI:N' in vector:  # No user interaction
+    if 'UI:N' in vector or 'NONE' in vector:  # No user interaction
         detect += 1
-    if 'S:C' in vector:  # Changed scope
+    if 'S:C' in vector or 'CHANGED' in vector:  # Changed scope
         recover += 2
     
     # Adjust based on impact components
-    if 'C:H' in vector:  # High confidentiality impact
+    if 'C:H' in vector or 'HIGH' in vector:  # High confidentiality impact
         identify += 2
         respond += 1
-    if 'I:H' in vector:  # High integrity impact
+    if 'I:H' in vector or 'HIGH' in vector:  # High integrity impact
         respond += 2
         recover += 2
-    if 'A:H' in vector:  # High availability impact
+    if 'A:H' in vector or 'HIGH' in vector:  # High availability impact
         respond += 1
         recover += 3
     
     # Is it known to be exploited?
-    if vuln_data.get('known_exploited', False):
+    if known_exploited:
         identify += 3
         protect += 2
         detect += 1
@@ -91,41 +92,44 @@ def calculate_csf_risk_score(vuln_data):
 def calculate_fair_risk_score(vuln_data):
     """
     Calculate a risk score based on FAIR (Factor Analysis of Information Risk).
-    
-    FAIR focuses on:
-    - Loss Event Frequency (LEF): How often might the vulnerability be exploited?
-    - Loss Magnitude (LM): What's the potential impact if exploited?
-    
-    Risk = LEF * LM
     """
-    # Extract relevant features
-    cvss = vuln_data.get('cvss', {})
-    base_score = cvss.get('base_score', 5.0)
-    exploitability = cvss.get('exploitability_score', base_score/2)
-    impact = cvss.get('impact_score', base_score/2)
+    # Extract relevant features directly matching CSV columns
+    if hasattr(vuln_data, 'get'):  # Dictionary-like access
+        base_score = float(vuln_data.get('base_score', 5.0) or 5.0)
+        exploitability = float(vuln_data.get('exploitability_score', base_score/2) or base_score/2)
+        impact = float(vuln_data.get('impact_score', base_score/2) or base_score/2)
+        known_exploited = vuln_data.get('known_exploited', False)
+        product_count = int(vuln_data.get('product_count', 0) or 0)
+        if isinstance(known_exploited, str):
+            known_exploited = known_exploited.lower() == 'true'
+    else:  # DataFrame row access
+        base_score = float(vuln_data['base_score'] if pd.notna(vuln_data['base_score']) else 5.0)
+        exploitability = float(vuln_data['exploitability_score'] if pd.notna(vuln_data['exploitability_score']) else base_score/2)
+        impact = float(vuln_data['impact_score'] if pd.notna(vuln_data['impact_score']) else base_score/2)
+        known_exploited = vuln_data['known_exploited'] if pd.notna(vuln_data['known_exploited']) else False
+        if isinstance(known_exploited, str):
+            known_exploited = known_exploited.lower() == 'true'
+        product_count = int(vuln_data['product_count'] if pd.notna(vuln_data['product_count']) else 0)
     
     # Calculate Loss Event Frequency (scale 1-10)
-    # Based on exploitability, known exploitation, and attack complexity
     lef_base = exploitability * 1.5  # Scale CVSS exploitability to 0-10
     
     # Adjust for known exploitation
-    if vuln_data.get('known_exploited', False):
+    if known_exploited:
         lef_base += 2
     
     # Cap at 10
-    lef = min(10, lef_base)
+    lef = min(10, max(1, lef_base))  # Ensure minimum of 1
     
     # Calculate Loss Magnitude (scale 1-10)
-    # Based on impact score and affected services
     lm_base = impact * 1.5  # Scale CVSS impact to 0-10
     
     # Adjust for number of affected products
-    product_count = len(vuln_data.get('products', []))
     lm_adjustment = min(3, product_count / 3)  # Up to +3 based on affected products
     lm_base += lm_adjustment
     
     # Cap at 10
-    lm = min(10, lm_base)
+    lm = min(10, max(1, lm_base))  # Ensure minimum of 1
     
     # Calculate risk (scale 1-100)
     fair_risk = lef * lm

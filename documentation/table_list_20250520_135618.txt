@@ -1,0 +1,19 @@
+# TWX Database Tables
+
+| Table Name | Description |
+|------------|-------------|
+| attack_techniques | |
+| capec_attack_mappings | |
+| capec_attack_patterns | |
+| cwe_capec_mappings | |
+| cwe_categories | |
+| cwe_category_mappings | |
+| metrics | |
+| products | |
+| vuln_references | |
+| vulnerabilities | |
+| vulnerability_attack_mappings | |
+| vulnerability_capec_mappings | |
+| vulnerability_products | |
+| vulnerability_weaknesses | |
+| weaknesses | |

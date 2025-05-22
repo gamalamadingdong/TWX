@@ -12,6 +12,7 @@ analysis/classification_data.csv
 data/*
 data_processing/data/twx_vulnerabilities.*
 analysis/shortened_data.csv
+analysis/reports/
 analysis/*.png
 analysis/*.csv
 analysis/vuln_type_distribution.png
@@ -29,3 +30,5 @@ storage/__pycache__/vulnerability_db.cpython-312.pyc
 **/__pycache__/**
 models/*.md
 logs/
+storage/__pycache__/vulnerability_db.cpython-312.pyc
+documentation/db_schema_20250520_135618.sql

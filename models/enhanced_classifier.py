@@ -11,6 +11,7 @@ import pandas as pd
 import numpy as np
 import joblib
 import re
+import json
 from time import time
 from sklearn.model_selection import train_test_split, GridSearchCV, StratifiedKFold
 from sklearn.ensemble import RandomForestClassifier, VotingClassifier, HistGradientBoostingClassifier
@@ -62,6 +63,49 @@ class ModelWrapper:
         else:
             X_combined = X[self.num_features].fillna(0).values
         return self.model.predict_proba(X_combined)
+
+def analyze_dataset_metadata(data_path):
+    """Analyze dataset metadata to understand available fields and data quality."""
+    # First check if we have JSON metadata
+    if data_path.lower().endswith('.json'):
+        metadata_path = data_path.replace('.json', '_metadata.json')
+        if os.path.exists(metadata_path):
+            try:
+                with open(metadata_path, 'r') as f:
+                    metadata = json.load(f)
+                print("Dataset metadata:")
+                print(f"  Export date: {metadata.get('export_date')}")
+                print(f"  Record count: {metadata.get('record_count')}")
+                print(f"  TWX version: {metadata.get('twx_version')}")
+                print(f"  Available fields: {len(metadata.get('fields', []))} fields")
+                return metadata
+            except Exception as e:
+                print(f"Error reading metadata: {e}")
+    
+    # If no metadata file or it's CSV, analyze the actual data
+    if data_path.lower().endswith('.json'):
+        df = pd.read_json(data_path, orient='records')
+    else:
+        df = pd.read_csv(data_path, low_memory=False)
+    
+    print("Dataset statistics:")
+    print(f"  Records: {len(df)}")
+    print(f"  Columns: {len(df.columns)}")
+    print(f"  Date range: {df['published'].min()} to {df['published'].max()}")
+    
+    # Check for important columns
+    key_cols = ['vuln_id', 'description', 'primary_cwe', 'vuln_type', 
+                'vendors', 'products', 'patch_date', 'days_to_patch']
+    missing = [col for col in key_cols if col not in df.columns]
+    if missing:
+        print(f"  WARNING: Missing key columns: {missing}")
+    
+    return {
+        "record_count": len(df),
+        "fields": list(df.columns),
+        "missing_fields": missing
+    }
+
 def load_validation_data(validation_file="models/validation_sample.csv"):
     """
     Load the manually validated vulnerability data.
@@ -293,8 +337,14 @@ def prepare_enhanced_data(data_path, validation_file=None, include_text=True):
         X, y, and feature information
     """
     print(f"Loading data from {data_path}")
-    df = pd.read_csv(data_path, low_memory=False, parse_dates=['published', 'modified'])
-    
+    if data_path.lower().endswith('.json'):
+    # Load JSON data
+        df = pd.read_json(data_path, orient='records')
+        print(f"Loaded {len(df)} records from JSON")
+    else:
+        # Fall back to CSV for compatibility
+        df = pd.read_csv(data_path, low_memory=False, parse_dates=['published', 'modified'])
+        print(f"Loaded {len(df)} records from CSV")  
     # Check for NaN values in the dataset before processing
     nan_counts = df.isna().sum()
     print("NaN counts before preprocessing:")
@@ -848,8 +898,8 @@ def main():
     import argparse
     
     parser = argparse.ArgumentParser(description='Train enhanced vulnerability classifier')
-    parser.add_argument('--train', type=str, default="analysis/classification_data.csv",
-                        help='Path to training data CSV')
+    parser.add_argument('--train', type=str, default="analysis/classification_data.json",
+                    help='Path to training data (JSON or CSV)')
     parser.add_argument('--validate', type=str, default=None, 
                         help='Path to validation data CSV (with manual labels)')
     parser.add_argument('--output', type=str, default="models/enhanced_vuln_classifier.joblib",
