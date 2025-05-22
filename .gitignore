@@ -35,3 +35,4 @@ documentation/db_schema_20250520_135618.sql
 storage/__pycache__/vulnerability_db.cpython-312.pyc
 documentation/db_schema.sql
 storage/__pycache__/vulnerability_db.cpython-312.pyc
+.env.*
