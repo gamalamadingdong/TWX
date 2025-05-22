@@ -8,73 +8,107 @@ import sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from storage.vulnerability_db import VulnerabilityDatabase
 
-# Update the extract_features_from_db function to support PostgreSQL
-def extract_features_from_db(db_path=None, output_path="analysis/classification_data.csv", use_postgres=False):
-    """Extract classification features directly from the database."""
-    
+def parse_cvss_vector_fields(df, vector_col='cvss_vector'):
+    """
+    Parse CVSS vector strings and extract key fields (AC, UI, AV, PR, etc.) into new columns.
+    """
+    import re
+    def extract_cvss_fields(vector):
+        fields = {'ac': '', 'ui': '', 'av': '', 'pr': '', 's': '', 'c': '', 'i': '', 'a': ''}
+        if not isinstance(vector, str):
+            return fields
+        vector = re.sub(r'^CVSS:[\d.]+/', '', vector)
+        for part in vector.split('/'):
+            if ':' in part:
+                k, v = part.split(':', 1)
+                k = k.lower()
+                v = v.upper()
+                if k in fields:
+                    fields[k] = v
+        return fields
+    cvss_fields = df[vector_col].apply(extract_cvss_fields)
+    cvss_df = pd.DataFrame(list(cvss_fields))
+    for col in cvss_df.columns:
+        df[col] = cvss_df[col]
+    return df
+
+def extract_features_from_db(db_path=None, output_path="analysis/classification_data.json", use_postgres=True):
+    """
+    Extract classification features directly from the database and save as JSON.
+    Ensures alignment with the enhanced_classifier.py feature expectations.
+    """
     # Initialize database connection based on backend
     if use_postgres:
         from storage.postgresql_db import PostgresqlVulnerabilityDatabase
         db = PostgresqlVulnerabilityDatabase()
+        # Use export_to_json to get a DataFrame
+        df = db.export_to_json(output_path=output_path)
     else:
         from storage.vulnerability_db import VulnerabilityDatabase
-        db = VulnerabilityDatabase(db_path)
-    
-    # Export data to CSV with all necessary features
-    df = db.export_to_csv(output_path)
-    
-    # Close database connection
-    db.close()
-    
+        db_file = db_path if db_path is not None else "storage/vulnerabilities.db"
+        db = VulnerabilityDatabase(db_file)
+        # You may need to implement a similar export for SQLite
+        raise NotImplementedError("Only Postgres export is supported in this script.")
+
+    # If export_to_json returns None, fallback to manual SQL
+    if df is None or not isinstance(df, pd.DataFrame):
+        query = """
+        SELECT
+            id as vuln_id,
+            description,
+            published,
+            modified,
+            cwe as cwe,
+            cwe_name,
+            cwe_category,
+            vendor,
+            product,
+            cvss_vector,
+            base_score,
+            exploitability_score,
+            impact_score,
+            attack_vector as av,
+            attack_complexity as ac,
+            privileges_required as pr,
+            user_interaction as ui,
+            scope as s,
+            confidentiality_impact as c,
+            integrity_impact as i,
+            availability_impact as a,
+            known_exploited,
+            has_cisa_advisory,
+            has_vendor_advisory,
+            product_count,
+            reference_count,
+            days_to_patch,
+            exploit_maturity,
+            epss_score,
+            epss_percentile,
+            patch_date,
+            primary_cwe,
+            vuln_type
+        FROM vulnerabilities
+        ORDER BY published DESC
+        """
+        conn = db.connect()
+        df = pd.read_sql_query(query, conn)
+        db.close()
+
+    # Parse CVSS vector fields if not already present
+    if "cvss_vector" in df.columns:
+        df = parse_cvss_vector_fields(df, vector_col="cvss_vector")
+
+    # Save as JSON for classifier
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    df.to_json(output_path, orient="records", indent=2, date_format="iso")
+    print(f"Classification data exported to {output_path} ({len(df)} records)")
+
+    # Optionally, save a sample for quick inspection
+    sample_path = output_path.replace(".json", "_sample.json")
+    df.head(50).to_json(sample_path, orient="records", indent=2, date_format="iso")
+    print(f"Sample data exported to {sample_path}")
+
     return df
 
-def process_all_data():
-    """Process all data sources and store in SQLite database."""
-    # Initialize database
-    db = VulnerabilityDatabase()
-    
-    # Process CVE data
-    cve_dir = "raw_data/cve_data/cves"
-    if os.path.exists(cve_dir):
-        print(f"Processing CVE data from {cve_dir}...")
-        cve_records = parse_cve_directory(cve_dir)
-        inserted = db.batch_insert_vulnerabilities(cve_records)
-        print(f"Inserted {inserted} CVE records into database")
-    else:
-        print(f"Warning: CVE directory not found at {cve_dir}")
-    
-    # Process NVD data
-    nvd_dir = "raw_data/nvd_data"
-    if os.path.exists(nvd_dir):
-        print(f"Processing NVD data from {nvd_dir}...")
-        nvd_files = [f for f in os.listdir(nvd_dir) if f.endswith('.json')]
-        
-        for nvd_file in nvd_files:
-            file_path = os.path.join(nvd_dir, nvd_file)
-            print(f"Processing {file_path}...")
-            nvd_records = parse_nvd_directory(file_path)
-            inserted = db.batch_insert_vulnerabilities(nvd_records)
-            print(f"Inserted {inserted} NVD records from {nvd_file} into database")
-    else:
-        print(f"Warning: NVD directory not found at {nvd_dir}")
-    
-    print("All data processed and stored in SQLite database")
-    return db
-
 if __name__ == "__main__":
-    # Process and store data in SQLite
-    db = process_all_data()
-    
-    # Extract features directly from database
-    df = extract_features_from_db()
-    
-    # Print summary statistics
-    print(f"\nDataset statistics:")
-    print(f"  Total vulnerabilities: {len(df)}")
-    print(f"  Known exploited: {df['known_exploited'].sum()} ({df['known_exploited'].sum()/len(df)*100:.1f}%)")
-    print(f"  With CISA advisory: {df['has_cisa_advisory'].sum()} ({df['has_cisa_advisory'].sum()/len(df)*100:.1f}%)")
-    print(f"  With vendor advisory: {df['has_vendor_advisory'].sum()} ({df['has_vendor_advisory'].sum()/len(df)*100:.1f}%)")
-    
-    # This field may need to be created by the export_to_csv method
-    if 'has_attack_mapping' in df.columns:
-        print(f"  With ATT&CK mapping: {df['has_attack_mapping'].sum()} ({df['has_attack_mapping'].sum()/len(df)*100:.1f}%)")
+    extract_features_from_db()

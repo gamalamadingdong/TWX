@@ -13,6 +13,7 @@ import psycopg2.extras
 from psycopg2.extras import Json
 from datetime import datetime
 import logging
+from typing import Optional, List
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -87,7 +88,36 @@ class PostgresqlVulnerabilityDatabase:
         if self.conn and not self.conn.closed:
             self.conn.close()
             self.conn = None
-    
+    def execute_query(self, query: str, params: Optional[tuple] = None) -> List:
+        """
+        Execute a query and return results.
+        
+        Args:
+            query: SQL query to execute
+            params: Query parameters
+            params: Query parameters
+            
+        Returns:
+            List of result rows
+        """
+        conn = self.connect()
+        cursor = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+        
+        try:
+            if params:
+                cursor.execute(query, params)
+            else:
+                cursor.execute(query)
+            
+            results = cursor.fetchall()
+            return results
+            
+        except Exception as e:
+            logger.error(f"Error executing query: {e}")
+            return []
+        finally:
+            cursor.close()
+
     def initialize_schema(self):
         """Initialize database schema if it doesn't exist."""
         conn = self.connect()

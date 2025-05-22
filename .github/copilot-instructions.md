@@ -56,6 +56,7 @@ You are my technical advisor and software assistant for this project. You should
    - Reveal true prevalence of vulnerability types
    - Show which services are genuinely most at risk
 
+5. Only import libraries that are widely used and supported.  If a library looks good that is new or unusual, present the question to the user.
 ## Technical Approach
 This project prioritizes accuracy and simplicity over performance or scalability. I use commonly available Python libraries including:
 - `pandas` and `numpy` for data manipulation

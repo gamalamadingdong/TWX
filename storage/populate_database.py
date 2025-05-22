@@ -11,6 +11,7 @@ import logging
 from datetime import datetime
 from tqdm import tqdm
 import psycopg2
+from psycopg2.extras import Json
 
 # Add parent directory to path for imports
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -476,35 +477,47 @@ def ensure_directories(base_dirs=None, raw_dirs=None):
         logger.debug(f"Ensured directory exists: {directory}")
 
 def export_db_schema(db, output_path="documentation/db_schema.sql"):
-    """Export the database schema to a SQL file."""
+    """Export the PostgreSQL database schema to a SQL file."""
     conn = db.connect()
     cursor = conn.cursor()
-    
+
     # Create output directory if it doesn't exist
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    
+
     with open(output_path, 'w') as f:
         # Write header
         f.write("-- TWX Database Schema\n")
         f.write(f"-- Generated: {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n")
-        
+
         # Get all table definitions
-        cursor.execute("SELECT name, sql FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%';")
-        tables = cursor.fetchall()
-        
+        cursor.execute("""
+            SELECT table_name
+            FROM information_schema.tables
+            WHERE table_schema = 'public'
+            AND table_type = 'BASE TABLE';
+        """)
+        tables = [row[0] for row in cursor.fetchall()]
+
         f.write("-- TABLES\n")
-        for name, sql in tables:
-            f.write(f"{sql};\n\n")
-        
+        for table in tables:
+            cursor.execute(f"SELECT pg_get_tabledef('{table}'::regclass);")
+            tabledef = cursor.fetchone()
+            if tabledef and tabledef[0]:
+                f.write(f"{tabledef[0]}\n\n")
+
         # Get all index definitions
-        cursor.execute("SELECT name, sql FROM sqlite_master WHERE type='index' AND sql IS NOT NULL;")
+        cursor.execute("""
+            SELECT indexdef
+            FROM pg_indexes
+            WHERE schemaname = 'public';
+        """)
         indexes = cursor.fetchall()
-        
+
         if indexes:
             f.write("-- INDEXES\n")
-            for name, sql in indexes:
+            for (sql,) in indexes:
                 f.write(f"{sql};\n\n")
-    
+
     logger.info(f"Database schema exported to {output_path}")
     return True
 
@@ -584,6 +597,7 @@ def process_nvd_data(db, raw_dir, processed_dir, force=False):
     return all_nvd_records
 
 def unify_vulnerability_data(cve_records, nvd_records, processed_dir):
+
     """
     Merge CVE and NVD data for the same vulnerabilities without losing data.
     

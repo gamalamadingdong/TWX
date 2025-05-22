@@ -16,7 +16,7 @@ from time import time
 from sklearn.model_selection import train_test_split, GridSearchCV, StratifiedKFold
 from sklearn.ensemble import RandomForestClassifier, VotingClassifier, HistGradientBoostingClassifier
 from sklearn.linear_model import LogisticRegression
-from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.preprocessing import OneHotEncoder, StandardScaler, LabelEncoder
 from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
 from sklearn.metrics import classification_report, confusion_matrix, f1_score
@@ -31,6 +31,55 @@ sys.path.append(root_dir)
 
 from storage.vulnerability_db import VulnerabilityDatabase
 
+# --- Fuzzy vulnerability type matching ---
+TYPE_SYNONYMS = {
+    "Buffer Overflow": {"Buffer Overflow", "Heap Overflow", "Stack Overflow", "Buffer Overrun", "Out-of-bounds Write"},
+    "SQL Injection": {"SQL Injection", "SQLi", "SQL Code Injection"},
+    "Cross-site Scripting (XSS)": {"Cross-site Scripting (XSS)", "XSS", "Cross Site Scripting", "Stored XSS", "Reflected XSS", "DOM-based XSS"},
+    "Path Traversal": {"Path Traversal", "Directory Traversal", "File Path Traversal"},
+    "Command Injection": {"Command Injection", "OS Command Injection", "Shell Injection"},
+    "Deserialization": {"Deserialization", "Insecure Deserialization"},
+    "Race Condition": {"Race Condition", "TOCTOU", "Time-of-check Time-of-use"},
+    "Authentication Bypass": {"Authentication Bypass", "Auth Bypass", "Improper Authentication"},
+    "Privilege Escalation": {"Privilege Escalation", "Elevation of Privilege", "EoP"},
+    "Information Disclosure": {"Information Disclosure", "Sensitive Data Exposure", "Data Leak"},
+    "Denial of Service": {"Denial of Service", "DoS", "Resource Exhaustion"},
+    "Improper Input Validation": {"Improper Input Validation", "Input Validation", "Improper Validation"},
+    "Cross-Site Request Forgery (CSRF)": {"Cross-Site Request Forgery (CSRF)", "CSRF"},
+    "Memory Corruption": {"Memory Corruption", "Use After Free", "Dangling Pointer", "Double Free"},
+    "Code Execution": {"Code Execution", "Remote Code Execution", "RCE", "Arbitrary Code Execution"},
+    "Directory Listing": {"Directory Listing", "Directory Indexing"},
+    "Improper Access Control": {"Improper Access Control", "Authorization Bypass", "Access Control"},
+    "XML External Entity (XXE)": {"XML External Entity (XXE)", "XXE"},
+    "Server-Side Request Forgery (SSRF)": {"Server-Side Request Forgery (SSRF)", "SSRF"},
+    "Open Redirect": {"Open Redirect", "URL Redirection"},
+    "Unrestricted File Upload": {"Unrestricted File Upload", "Arbitrary File Upload"},
+    "Improper Certificate Validation": {"Improper Certificate Validation", "SSL Validation", "TLS Validation"},
+    "Improper Error Handling": {"Improper Error Handling", "Information Exposure Through Error Message"},
+    "Improper Authorization": {"Improper Authorization", "Authorization Bypass"},
+    "Improper Resource Shutdown or Release": {"Improper Resource Shutdown or Release", "Resource Leak"},
+    # Add more as needed
+}
+
+def fuzzy_type_match(predicted, validated):
+    """
+    Returns True if predicted and validated types are considered a fuzzy match.
+    """
+    if not predicted or not validated:
+        return False
+    predicted = predicted.strip()
+    validated = validated.strip()
+    # Exact match
+    if predicted == validated:
+        return True
+    # Synonym/alias match
+    for synonyms in TYPE_SYNONYMS.values():
+        if predicted in synonyms and validated in synonyms:
+            return True
+    # Partial string match (case-insensitive)
+    if predicted.lower() in validated.lower() or validated.lower() in predicted.lower():
+        return True
+    return False
 
 # Add this class at the module level (before any function definitions)
 class ModelWrapper:
@@ -323,7 +372,7 @@ def extract_text_features(df):
     
     return df
 
-def prepare_enhanced_data(data_path, validation_file=None, include_text=True):
+def prepare_enhanced_data(data_path, validation_file=None, include_text=True, filter_unknown=False):
     """
     Load and prepare data for vulnerability type classification with robust NaN handling
     and enhanced feature extraction.
@@ -332,6 +381,7 @@ def prepare_enhanced_data(data_path, validation_file=None, include_text=True):
         data_path: Path to the main dataset CSV
         validation_file: Path to validation data CSV
         include_text: Whether to include text features
+        filter_unknown: Whether to filter out "Unknown" or "Other" vulnerability types
         
     Returns:
         X, y, and feature information
@@ -406,6 +456,13 @@ def prepare_enhanced_data(data_path, validation_file=None, include_text=True):
                 print(f"  Filling {missing} NaN values in '{feat}' with ''")
                 df[feat] = df[feat].fillna("")
     
+    # Drop features with high missingness
+    missing_threshold = 0.8
+    for col in df.columns:
+        if df[col].isna().mean() > missing_threshold:
+            print(f"Dropping feature '{col}' due to high missingness ({df[col].isna().mean()*100:.1f}%)")
+            df = df.drop(columns=[col])
+    
     # Map CWE to vulnerability types if needed
     if 'vuln_type' not in df.columns:
         print("Mapping CWE to vulnerability types...")
@@ -468,9 +525,15 @@ def prepare_enhanced_data(data_path, validation_file=None, include_text=True):
         df['cwe_group'] = df['cwe'].fillna('Unknown').apply(lambda x: extract_cwe_group(x) if isinstance(x, str) else 'Unknown')
         cat_features.append('cwe_group')
     
+    # Filter out "Unknown"/"Other" if requested
+    if filter_unknown:
+        mask = ~df['vuln_type'].isin(['Unknown', 'Other'])
+        df = df[mask]
+        print(f"Filtered out {mask.sum()} 'Unknown'/'Other' records for training.")
+    
     # Filter out very rare vulnerability classes
     class_counts = df['vuln_type'].value_counts()
-    min_samples_per_class = 10
+    min_samples_per_class = 25  # Increased from 10
     rare_classes = class_counts[class_counts < min_samples_per_class].index
     print(f"Grouping {len(rare_classes)} rare vulnerability types with fewer than {min_samples_per_class} samples into 'Other'")
     df.loc[df['vuln_type'].isin(rare_classes), 'vuln_type'] = 'Other'
@@ -510,10 +573,10 @@ def prepare_enhanced_data(data_path, validation_file=None, include_text=True):
     
     # Prepare final features
     feature_columns = final_cat_features + final_num_features + final_text_features + final_semantic_features
-    
+    df['vuln_type'] = df['vuln_type'].astype(str)
     # Create final feature matrix and target
     X = df[feature_columns]
-    y = df['vuln_type']
+    y = df['vuln_type'].astype(str)
     
     # Final check for NaN values
     nan_cols = X.columns[X.isna().any()].tolist()
@@ -633,41 +696,65 @@ def build_enhanced_classifier(X_train, y_train, feature_info):
     max_time = 600  # 10 minutes
     
     # Check dataset size and use subsampling if too large
-    if len(X_train) > 100000:
-        print(f"Large dataset detected ({len(X_train)} samples). Using reduced complexity approach.")
-        # Skip the ensemble and go straight to a simpler model
-        return _build_simple_classifier(X_train, y_train, preprocessor, feature_info)
+    #if len(X_train) > 100000:
+    #    print(f"Large dataset detected ({len(X_train)} samples). Using reduced complexity approach.")
+    #    # Skip the ensemble and go straight to a simpler model
+    #    return _build_simple_classifier(X_train, y_train, preprocessor, feature_info)
     
     try:
-        print("Building simplified ensemble classifier...")
-        # Define base classifiers for ensemble - simpler configuration
+        print("Building enhanced ensemble classifier...")
+        
+            # Create custom class weights: downweight 'Other' and 'Unknown'
+        unique_classes = np.unique(y_train)
+
+        label_encoder = LabelEncoder()
+        y_train_encoded = label_encoder.fit_transform(y_train)
+        class_labels = label_encoder.classes_
+        #print("Unique Classes" , unique_classes)
+        #print("Type of y_train[0]:", type(y_train.iloc[0]))
+        class_weights = {cls: 1.0 for cls in unique_classes}
+        #print ("Class weights dict:", class_weights)
+        #print("Class weights dict keys:", list(class_weights.keys()))
+        for low_info in ['Other', 'Unknown']:
+            if low_info in class_labels:
+                idx = list(class_labels).index(low_info)
+                class_weights[low_info] = 0.2  # Downweight these classes
+
+        # Define base classifiers for ensemble
         rf = RandomForestClassifier(
-            n_estimators=50,  # Reduced from 100
-            max_depth=15,     # Reduced from 20
-            min_samples_split=10,
+            n_estimators=500,  # Increased from 50
+            max_depth=None,      # Increased from 10-15
+            min_samples_split=5,
             class_weight='balanced',
             random_state=42,
-            verbose=1,        # Add verbosity to see progress
-            n_jobs=-1         # Use all available cores
+            verbose=1,
+            n_jobs=-1
         )
         
-        # Use HistGradientBoosting which handles missing values well and is faster
         hgb = HistGradientBoostingClassifier(
-            max_iter=50,      # Reduced from 100
-            learning_rate=0.1,
-            max_depth=10,     # Reduced from 20
+            max_iter=500,      # Increased from 50
+            max_depth=30,      # Increased from 10
+            learning_rate=0.05, # Slightly slower learning
             random_state=42,
-            verbose=1         # Add verbosity
+            verbose=1
         )
         
-        # Create simpler voting ensemble (just 2 models instead of 3)
+        lr = LogisticRegression(
+            max_iter=2000, 
+            class_weight='balanced', 
+            solver='saga', 
+            n_jobs=-1
+        )
+        
+        # Create voting ensemble
         ensemble = VotingClassifier(
             estimators=[
                 ('rf', rf),
-                ('hgb', hgb)
+                ('hgb', hgb),
+                ('lr', lr)
             ],
-            voting='hard',    # Use hard voting (faster than soft)
-            verbose=True      # Add verbosity
+            voting='soft',    # Use soft voting for better probability averaging
+            verbose=True
         )
         
         # Create pipeline with preprocessor and classifier
@@ -676,12 +763,13 @@ def build_enhanced_classifier(X_train, y_train, feature_info):
             ('classifier', ensemble)
         ], verbose=True)  # Add verbosity to pipeline
         
+
         # Fit the model
         print("Training classification model (10 minute time limit)...")
         print("Progress updates will be shown during training.")
         
         # Use a timer to enforce the timeout
-        pipeline.fit(X_train, y_train)
+        pipeline.fit(X_train, np.array(y_train_encoded))
         training_time = time() - start_time
         print(f"Model training completed in {training_time:.1f} seconds")
         
@@ -706,7 +794,7 @@ def _build_simple_classifier(X_train, y_train, preprocessor, feature_info):
     if len(X_train) > sample_size:
         print(f"Subsampling training data from {len(X_train)} to {sample_size} samples")
         # Create stratified sample
-        from sklearn.model_selection import train_test_split
+        
         X_sample, _, y_sample, _ = train_test_split(
             X_train, y_train, 
             train_size=sample_size,
@@ -781,7 +869,9 @@ def evaluate_model(model, X_test, y_test, output_dir="models"):
     """Evaluate model and generate detailed performance metrics."""
     print("Evaluating model performance...")
     y_pred = model.predict(X_test)
-    
+    #if hasattr(model, 'label_encoder'):
+    #    y_pred = model.label_encoder.inverse_transform(y_pred)
+
     # Calculate and print metrics
     print("\nClassification Report:")
     report = classification_report(y_test, y_pred)
@@ -823,57 +913,47 @@ def evaluate_model(model, X_test, y_test, output_dir="models"):
 
 def evaluate_on_validation(model, data_path, output_dir="models"):
     """
-    Evaluate the model using a validation dataset.
-    
-    Args:
-        model: Trained classification pipeline
-        data_path: Path to the validation dataset CSV
-        output_dir: Directory to save output files
-        
-    Returns:
-        Classification report and confusion matrix
+    Evaluate model and generate detailed performance metrics using fuzzy type matching.
+    Includes debugging checks for label and feature alignment.
     """
-    print(f"Evaluating model on validation data: {data_path}")
-    
     try:
-        val_df = pd.read_csv(data_path, low_memory=False)
-        
-        # Check for validated_type column
-        if 'validated_type' not in val_df.columns or val_df['validated_type'].isna().all():
-            print("Warning: Validation dataset doesn't have manually validated labels")
-            if 'vuln_type' not in val_df.columns:
-                print("Error: No target labels available for validation")
-                return None, None
-            # Fall back to vuln_type if no validated_type
-            val_df['final_type'] = val_df['vuln_type']
+        val_df = pd.read_csv(data_path)
+        # Use validated_type where available, otherwise use vuln_type
+        if 'vuln_type' in val_df.columns:
+            val_df['final_type'] = val_df['validated_type'].fillna(val_df['vuln_type'])
         else:
-            # Use validated_type where available, otherwise use vuln_type
-            if 'vuln_type' in val_df.columns:
-                val_df['final_type'] = val_df['validated_type'].fillna(val_df['vuln_type'])
-            else:
-                # Only use records with validated_type
-                val_df = val_df.dropna(subset=['validated_type'])
-                val_df['final_type'] = val_df['validated_type']
-        
-        # Process validation data
+            val_df = val_df.dropna(subset=['validated_type'])
+            val_df['final_type'] = val_df['validated_type']
+
+        # Prepare features and labels
         X_val, y_val, _, _ = prepare_enhanced_data(data_path)
-        
-        # Predict and evaluate
         y_pred = model.predict(X_val)
-        
-        # Generate report
-        print("\nValidation Set Classification Report:")
-        report = classification_report(y_val, y_pred)
-        print(report)
-        
-        # Create confusion matrix
+
+        # --- Debugging checks ---
+        print("\n--- DEBUGGING LABELS AND FEATURES ---")
+        print("Sample of predicted vs. true labels (first 20):")
+        for pred, true in list(zip(y_pred, y_val))[:20]:
+            print(f"Predicted: {pred} | True: {true}")
+
+        print("\nUnique predicted types:", sorted(set(y_pred)))
+        print("Unique true types:", sorted(set(y_val)))
+        print("Value counts for true types:\n", pd.Series(y_val).value_counts())
+        print("Value counts for predicted types:\n", pd.Series(y_pred).value_counts())
+        print("Validation feature columns:", list(X_val.columns))
+
+        # Fuzzy matching evaluation
+        fuzzy_matches = [fuzzy_type_match(pred, true) for pred, true in zip(y_pred, y_val)]
+        fuzzy_accuracy = np.mean(fuzzy_matches)
+        print(f"\nFuzzy Accuracy (synonyms/close matches allowed): {fuzzy_accuracy:.3f}")
+
+        # Standard report for reference
+        print("\nValidation Set Classification Report (strict):")
+        print(classification_report(y_val, y_pred))
+
+        # Confusion matrix
         plt.figure(figsize=(14, 12))
         cm = confusion_matrix(y_val, y_pred, normalize='true')
-        
-        # Get unique classes for consistent ordering
         classes = sorted(np.unique(np.concatenate([y_val, y_pred])))
-        
-        # Plot confusion matrix
         sns.heatmap(cm, annot=True, fmt='.2f', cmap='Blues',
                     xticklabels=classes,
                     yticklabels=classes)
@@ -881,14 +961,12 @@ def evaluate_on_validation(model, data_path, output_dir="models"):
         plt.ylabel('True')
         plt.title('Validation Set - Normalized Confusion Matrix')
         plt.tight_layout()
-        
-        # Save the confusion matrix
         os.makedirs(output_dir, exist_ok=True)
         plt.savefig(f"{output_dir}/validation_confusion_matrix.png")
         plt.close()
-        
-        return report, cm
-        
+
+        return {"fuzzy_accuracy": fuzzy_accuracy}, cm
+
     except Exception as e:
         print(f"Error evaluating on validation data: {e}")
         return None, None
@@ -910,7 +988,7 @@ def main():
                        help='Path to validation data CSV for integrating validated types')
     parser.add_argument('--skip-training', action='store_true',
                        help='Skip training and load existing model')
-    parser.add_argument('--max-samples', type=int, default=100000,
+    parser.add_argument('--max-samples', type=int, default=200000,
                        help='Maximum number of samples to use for training')
     parser.add_argument('--fast', action='store_true',
                        help='Use fast mode with minimal processing')
@@ -945,7 +1023,6 @@ def main():
         # Check if dataset is very large and we should sample
         if len(X) > args.max_samples:
             print(f"Dataset is very large ({len(X)} samples). Subsampling to {args.max_samples} samples...")
-            from sklearn.model_selection import train_test_split
             X_sample, _, y_sample, _ = train_test_split(
                 X, y, 
                 train_size=args.max_samples,
@@ -1052,3 +1129,4 @@ def main():
     return model
 if __name__ == "__main__":
     main()
+
