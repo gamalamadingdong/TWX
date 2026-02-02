@@ -1,7 +1,4 @@
-# This was inspired by a recent conversation. TWX is an homage to the name of a program I worked on at a previous job that was intended to be a comprehensive system for threats and vulnerabilities.  This name is a play on that program.
-
-
-# TWX: Threat & Vulnerability Intelligence Analysis
+## TWX: Threat & Vulnerability Intelligence Analysis
 
 TWX is a Python-based system for collecting, processing, analyzing, and classifying cybersecurity threat and vulnerability data from public sources like CVE, NVD, and MITRE ATT&CK. It provides insights into vulnerability prevalence, attack vectors, and techniques while avoiding the bias of raw report counts.
 
